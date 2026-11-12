@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.2.0
+- Added direct Bitrix24 Chat (`/online/?IM_DIALOG=<ID>`) and Profile (`/company/personal/user/<ID>/`) links to the Device Summary contacts card.
+
 ## 1.1.2
 - Placed the contacts card at the top of `#p10info` (immediately above the Summary table / below action buttons) instead of the bottom below graphs.
 - Fixed stale card state when returning to a device Summary tab after configuring the Bitrix24 webhook from My Account.

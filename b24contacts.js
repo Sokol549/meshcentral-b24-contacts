@@ -79,6 +79,29 @@ function buildUserGetUrl(webhookUrl) {
     return parsed.toString();
 }
 
+function extractPortalOrigin(webhookUrl, portalUrl) {
+    var candidate = (typeof portalUrl === 'string' && portalUrl.trim()) ? portalUrl.trim() : webhookUrl;
+    if (typeof candidate !== 'string' || !candidate.trim()) return '';
+    try {
+        var parsed = new URL(candidate.trim());
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+        return parsed.origin;
+    } catch (e) {
+        return '';
+    }
+}
+
+function buildBitrixUserLinks(userId, portalOrigin) {
+    if (!portalOrigin || typeof userId !== 'string') return { profileUrl: '', chatUrl: '' };
+    var id = userId.trim();
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) return { profileUrl: '', chatUrl: '' };
+    var encId = encodeURIComponent(id);
+    return {
+        profileUrl: portalOrigin + '/company/personal/user/' + encId + '/',
+        chatUrl: portalOrigin + '/online/?IM_DIALOG=' + encId
+    };
+}
+
 function extractPluginConfigFromObject(cfg) {
     if (!cfg || typeof cfg !== 'object') return null;
     var settings = (cfg.settings && typeof cfg.settings === 'object') ? cfg.settings : null;
@@ -162,6 +185,7 @@ function loadSettings(server) {
         webhookUrl: typeof merged.webhookUrl === 'string' && merged.webhookUrl.trim()
             ? merged.webhookUrl.trim()
             : envUrl,
+        portalUrl: typeof merged.portalUrl === 'string' ? merged.portalUrl.trim() : '',
         cacheTtlMinutes: clampNumber(merged.cacheTtlMinutes, DEFAULT_CACHE_TTL_MINUTES, 5, 1440),
         minMatchScore: clampNumber(merged.minMatchScore, DEFAULT_MIN_MATCH_SCORE, 0.2, 0.95),
         requestTimeoutMs: clampNumber(merged.requestTimeoutMs, DEFAULT_TIMEOUT_MS, 2000, 60000),
@@ -801,12 +825,18 @@ function createPlugin(parent) {
         }
 
         var match = findBestContactMatch(nodeName, cache.users, settings.minMatchScore);
+        var profile = match.profile;
+        if (profile && profile.id) {
+            var portalOrigin = extractPortalOrigin(settings.webhookUrl, settings.portalUrl);
+            var links = buildBitrixUserLinks(profile.id, portalOrigin);
+            profile = Object.assign({}, profile, links);
+        }
         return {
             ok: true,
             matched: match.matched,
             score: match.score,
-            profile: match.profile,
-            phones: match.profile ? match.profile.phones : [],
+            profile: profile,
+            phones: profile ? profile.phones : [],
             cacheSize: cache.users.length,
             lastUpdated: cache.lastUpdated
         };
@@ -1085,6 +1115,7 @@ function createPlugin(parent) {
                     }
                     var nextSettings = {
                         webhookUrl: nextWebhookUrl,
+                        portalUrl: typeof incoming.portalUrl === 'string' ? incoming.portalUrl.trim() : current.portalUrl,
                         cacheTtlMinutes: clampNumber(incoming.cacheTtlMinutes, current.cacheTtlMinutes, 5, 1440),
                         minMatchScore: clampNumber(incoming.minMatchScore, current.minMatchScore, 0.2, 0.95),
                         requestTimeoutMs: clampNumber(incoming.requestTimeoutMs, current.requestTimeoutMs, 2000, 60000),
@@ -1266,6 +1297,10 @@ function createPlugin(parent) {
                 '#' + CARD_ID + ' .b24c-label{color:#64748b;font-size:12px;min-width:86px}',
                 '#' + CARD_ID + ' .b24c-link{color:#1d4ed8;font-weight:600;text-decoration:none}',
                 '#' + CARD_ID + ' .b24c-link:hover{text-decoration:underline}',
+                '#' + CARD_ID + ' .b24c-links{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0}',
+                '#' + CARD_ID + ' .b24c-pill{display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;color:#1d4ed8;font-size:12px;font-weight:600;text-decoration:none}',
+                '#' + CARD_ID + ' .b24c-pill:hover{background:#eff6ff;border-color:#93c5fd;text-decoration:none}',
+                '#' + CARD_ID + ' .b24c-pill svg{width:14px;height:14px;flex-shrink:0}',
                 '#' + CARD_ID + ' .b24c-muted{color:#6b7280;font-size:12px}',
                 '#' + CARD_ID + ' .b24c-error{color:#b91c1c;font-size:12px}',
                 '#' + CARD_ID + ' .b24c-inline-btn{margin-top:6px;background:#1769f5;color:#fff;border:1px solid #1769f5;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer}',
@@ -1327,6 +1362,19 @@ function createPlugin(parent) {
                 dot.setAttribute('y2', '18');
                 svg.appendChild(rect);
                 svg.appendChild(dot);
+            } else if (kind === 'chat') {
+                var chatPath = document.createElementNS(ns, 'path');
+                chatPath.setAttribute('d', 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z');
+                svg.appendChild(chatPath);
+            } else if (kind === 'user') {
+                var userBody = document.createElementNS(ns, 'path');
+                userBody.setAttribute('d', 'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2');
+                var userHead = document.createElementNS(ns, 'circle');
+                userHead.setAttribute('cx', '12');
+                userHead.setAttribute('cy', '7');
+                userHead.setAttribute('r', '4');
+                svg.appendChild(userBody);
+                svg.appendChild(userHead);
             } else {
                 var p = document.createElementNS(ns, 'path');
                 p.setAttribute('d', 'M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z');
@@ -1494,6 +1542,23 @@ function createPlugin(parent) {
             return typeof href === 'string' && /^tel:[+\d*#]+$/.test(href);
         }
 
+        function isSafeHttpUrl(url) {
+            return typeof url === 'string' && /^https?:\/\/[^\s]+$/i.test(url);
+        }
+
+        function createActionLink(url, text, iconKind) {
+            var a = document.createElement('a');
+            a.className = 'b24c-pill';
+            a.href = url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.appendChild(createSvgIcon(iconKind));
+            var span = document.createElement('span');
+            span.textContent = text;
+            a.appendChild(span);
+            return a;
+        }
+
         function renderResult(node, data) {
             var card = ensureCardElement(node);
             if (!card) return;
@@ -1540,43 +1605,52 @@ function createPlugin(parent) {
                 noPhones.className = 'b24c-muted';
                 noPhones.textContent = 'Профиль найден, но номера телефонов не указаны';
                 body.appendChild(noPhones);
-                return;
-            }
+            } else {
+                var list = document.createElement('div');
+                list.className = 'b24c-phones';
 
-            var list = document.createElement('div');
-            list.className = 'b24c-phones';
+                for (var i = 0; i < phones.length; i++) {
+                    var phone = phones[i];
+                    if (!phone || !phone.display) continue;
 
-            for (var i = 0; i < phones.length; i++) {
-                var phone = phones[i];
-                if (!phone || !phone.display) continue;
+                    var row = document.createElement('div');
+                    row.className = 'b24c-phone-row';
 
-                var row = document.createElement('div');
-                row.className = 'b24c-phone-row';
+                    var icon = createSvgIcon(phone.type === 'mobile' ? 'mobile' : 'work');
+                    var label = document.createElement('span');
+                    label.className = 'b24c-label';
+                    label.textContent = (phone.label || (phone.type === 'mobile' ? 'Мобильный' : 'Рабочий')) + ':';
 
-                var icon = createSvgIcon(phone.type === 'mobile' ? 'mobile' : 'work');
-                var label = document.createElement('span');
-                label.className = 'b24c-label';
-                label.textContent = (phone.label || (phone.type === 'mobile' ? 'Мобильный' : 'Рабочий')) + ':';
+                    row.appendChild(icon);
+                    row.appendChild(label);
 
-                row.appendChild(icon);
-                row.appendChild(label);
+                    if (isSafeTelHref(phone.href)) {
+                        var link = document.createElement('a');
+                        link.className = 'b24c-link';
+                        link.href = phone.href;
+                        link.textContent = phone.display;
+                        row.appendChild(link);
+                    } else {
+                        var span = document.createElement('span');
+                        span.textContent = phone.display;
+                        row.appendChild(span);
+                    }
 
-                if (isSafeTelHref(phone.href)) {
-                    var link = document.createElement('a');
-                    link.className = 'b24c-link';
-                    link.href = phone.href;
-                    link.textContent = phone.display;
-                    row.appendChild(link);
-                } else {
-                    var span = document.createElement('span');
-                    span.textContent = phone.display;
-                    row.appendChild(span);
+                    list.appendChild(row);
                 }
 
-                list.appendChild(row);
+                body.appendChild(list);
             }
 
-            body.appendChild(list);
+            var hasChat = isSafeHttpUrl(data.profile.chatUrl);
+            var hasProfile = isSafeHttpUrl(data.profile.profileUrl);
+            if (hasChat || hasProfile) {
+                var linksBar = document.createElement('div');
+                linksBar.className = 'b24c-links';
+                if (hasChat) linksBar.appendChild(createActionLink(data.profile.chatUrl, 'Чат в Битрикс24', 'chat'));
+                if (hasProfile) linksBar.appendChild(createActionLink(data.profile.profileUrl, 'Профиль в Битрикс24', 'user'));
+                body.appendChild(linksBar);
+            }
         }
 
         function sendPluginAction(pluginaction, extra, pendingMap) {

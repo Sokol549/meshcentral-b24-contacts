@@ -472,6 +472,9 @@ async function testBitrixPaginationSettingsAndResilience() {
         });
         assert.equal(wsReply.matched, true);
         assert.equal(wsReply.phones.length, 2);
+        assert.equal(wsReply.profile.profileUrl, 'http://127.0.0.1:' + port + '/company/personal/user/3/');
+        assert.equal(wsReply.profile.chatUrl, 'http://127.0.0.1:' + port + '/online/?IM_DIALOG=3');
+        assert.ok(!wsReply.profile.profileUrl.includes('secret_token_xyz'));
 
         // Simulate Bitrix24 API failure: stale cache preserved
         failMode = true;
@@ -533,7 +536,9 @@ async function testFrontendInlineUi() {
         matched: true,
         profile: {
             id: '101',
-            displayName: '<img src=x onerror=alert(1)> ВА | Калининская, ул. Советская 38 - ЮБ'
+            displayName: '<img src=x onerror=alert(1)> ВА | Калининская, ул. Советская 38 - ЮБ',
+            chatUrl: 'https://bitrix.kzvs.org/online/?IM_DIALOG=101',
+            profileUrl: 'https://bitrix.kzvs.org/company/personal/user/101/'
         },
         phones: [
             { type: 'work', label: 'Рабочий', display: '+7 (86163) 21-0-00', href: 'tel:+78616321000' },
@@ -554,9 +559,12 @@ async function testFrontendInlineUi() {
         if (n.tagName === 'A') links.push(n);
         stack.push(...n.children);
     }
-    assert.equal(links.length, 2);
-    assert.equal(links[0].href, 'tel:+78616321000');
-    assert.equal(links[1].href, 'tel:+79181112233');
+    const hrefs = links.map((l) => l.href);
+    assert.equal(hrefs.length, 4);
+    assert.ok(hrefs.includes('tel:+78616321000'));
+    assert.ok(hrefs.includes('tel:+79181112233'));
+    assert.ok(hrefs.includes('https://bitrix.kzvs.org/online/?IM_DIALOG=101'));
+    assert.ok(hrefs.includes('https://bitrix.kzvs.org/company/personal/user/101/'));
 
     // Switch to needsConfig response -> shows setup button for admin
     windowObj.currentNode = { _id: 'node//2', name: 'ПК 2' };
