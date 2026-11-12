@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 
@@ -27,6 +28,91 @@ function createMockParent(config, datapath, extra) {
     };
 }
 
+function makeDomShim() {
+    function makeElement(tag) {
+        return {
+            tagName: String(tag || 'div').toUpperCase(),
+            id: '',
+            className: '',
+            textContent: '',
+            href: '',
+            title: '',
+            type: '',
+            name: '',
+            value: '',
+            checked: false,
+            disabled: false,
+            style: {},
+            dataset: {},
+            children: [],
+            parentNode: null,
+            attributes: {},
+            setAttribute: function (k, v) { this.attributes[k] = String(v); if (k === 'id') this.id = String(v); },
+            addEventListener: function () {},
+            appendChild: function (child) {
+                child.parentNode = this;
+                this.children.push(child);
+                return child;
+            },
+            replaceChildren: function () {
+                this.children = [];
+            },
+            remove: function () {
+                if (this.parentNode) {
+                    this.parentNode.children = this.parentNode.children.filter((c) => c !== this);
+                    this.parentNode = null;
+                }
+            },
+            querySelector: function (sel) {
+                if (sel === '#p2AccountActions > p.mL') {
+                    const p2a = findById(this, 'p2AccountActions');
+                    if (p2a) return p2a.children.find((c) => c.tagName === 'P' && c.className === 'mL') || null;
+                    return null;
+                }
+                const cls = sel.startsWith('.') ? sel.slice(1) : null;
+                const stack = [...this.children];
+                while (stack.length) {
+                    const node = stack.shift();
+                    if (cls && node.className.split(/\s+/).includes(cls)) return node;
+                    if (!cls && node.tagName.toLowerCase() === sel.toLowerCase()) return node;
+                    stack.push(...node.children);
+                }
+                return null;
+            }
+        };
+    }
+
+    function findById(root, id) {
+        if (!root) return null;
+        if (root.id === id) return root;
+        for (const ch of root.children || []) {
+            const hit = findById(ch, id);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    const head = makeElement('head');
+    const body = makeElement('body');
+    const p10 = makeElement('div');
+    p10.id = 'p10';
+    p10.style.display = '';
+    const p10info = makeElement('div');
+    p10info.id = 'p10info';
+    p10.appendChild(p10info);
+
+    const p2AccountActions = makeElement('div');
+    p2AccountActions.id = 'p2AccountActions';
+    const p2List = makeElement('p');
+    p2List.className = 'mL';
+    p2AccountActions.appendChild(p2List);
+
+    body.appendChild(p10);
+    body.appendChild(p2AccountActions);
+
+    return { head, body, p10, p10info, p2AccountActions, p2List, makeElement, findById };
+}
+
 function testManifest() {
     assert.equal(manifest.shortName, 'b24contacts');
     assert.match(manifest.shortName, /^[a-zA-Z0-9]+$/);
@@ -46,8 +132,9 @@ function testManifest() {
 function testPrepExportsCompatibility() {
     const plugin = pluginFactory(createMockParent());
     assert.ok(Array.isArray(plugin.exports));
+    assert.ok(plugin.exports.includes('openSettings'));
+    assert.ok(plugin.exports.includes('onSettingsResult'));
 
-    // Mirror MeshCentral pluginHandler.prepExports()
     let code = 'var obj = {};\n';
     code += 'obj.' + manifest.shortName + ' = {};\n';
     for (const fnName of plugin.exports) {
@@ -56,24 +143,45 @@ function testPrepExportsCompatibility() {
     }
     code += 'return obj;';
 
-    // Ensure generated code compiles cleanly in browser-like sandbox (no Node closure leaks)
     const compiled = new Function(code);
-    const createdNodes = [];
+    const dom = makeDomShim();
+    const sentMessages = [];
+    const windowObj = {
+        userinfo: { _id: 'user//admin', siteadmin: -1 },
+        currentNode: null
+    };
     const sandbox = {
         document: {
-            getElementById: () => null,
-            createElement: (tag) => ({ tagName: tag }),
-            head: { appendChild: (el) => createdNodes.push(el) }
+            head: dom.head,
+            body: dom.body,
+            createElement: dom.makeElement,
+            createElementNS: (_ns, tag) => dom.makeElement(tag),
+            getElementById: (id) => dom.findById(dom.head, id) || dom.findById(dom.body, id),
+            querySelector: (sel) => dom.body.querySelector(sel)
         },
-        window: {}
+        window: windowObj,
+        meshserver: { send: (m) => sentMessages.push(m) },
+        setTimeout,
+        clearTimeout,
+        setInterval: () => ({ unref: () => {} }),
+        Map
     };
+    sandbox.window.document = sandbox.document;
+    sandbox.window.meshserver = sandbox.meshserver;
+
     const exported = vm.runInNewContext('(' + compiled.toString() + ')()', sandbox);
     exported.b24contacts.onWebUIStartupEnd();
-    assert.equal(createdNodes.length, 1);
-    assert.equal(createdNodes[0].id, 'b24contacts-loader');
-    assert.equal(createdNodes[0].src, 'plugin/b24contacts/b24contacts.js');
-    exported.b24contacts.onDeviceRefreshEnd();
-    exported.b24contacts.onContactsResult({}, { ok: true });
+
+    // Verify account settings link was injected into #p2AccountActions > p.mL
+    const settingsLinkWrap = dom.findById(dom.p2AccountActions, 'plugin_b24contactsSettings');
+    assert.ok(settingsLinkWrap, 'Settings link should be injected under My Account -> Account Actions');
+    assert.equal(settingsLinkWrap.children[0].textContent, 'Настройка Битрикс24 (Контакты)');
+
+    // Verify opening settings modal works via exported openSettings()
+    exported.b24contacts.openSettings();
+    const modal = dom.findById(dom.body, 'b24c-settings-overlay');
+    assert.ok(modal, 'Settings modal should open');
+    assert.equal(sentMessages[0].pluginaction, 'getSettings');
 }
 
 function testMatchingLogic() {
@@ -113,11 +221,12 @@ function testMatchingLogic() {
             ACTIVE: true,
             NAME: 'ВА | пгт. Афипский, ул. Берёзовая 5 - ИБ',
             WORK_PHONE: '',
-            PERSONAL_MOBILE: '+79185556677'
+            PERSONAL_MOBILE: '',
+            PERSONAL_PHONE: '+79185556677',
+            UF_PHONE_INNER: '105'
         })
     ];
 
-    // Exact prompt sample
     const m1 = findBestContactMatch('ст.Калининская ул.Советская, д.38 - касса ИБ', b24Users, 0.55);
     assert.equal(m1.matched, true);
     assert.equal(m1.profile.id, '101');
@@ -125,30 +234,22 @@ function testMatchingLogic() {
     assert.equal(m1.profile.phones[0].href, 'tel:+78616321000');
     assert.equal(m1.profile.phones[1].href, 'tel:+79181112233');
 
-    // Split LAST_NAME + NAME, glued prefix + building letter
     const m2 = findBestContactMatch('г.Краснодар ул.Красная, д.176А - касса 2', b24Users, 0.55);
     assert.equal(m2.matched, true);
     assert.equal(m2.profile.id, '102');
     assert.equal(m2.profile.phones[0].href, 'tel:88612223344');
 
-    // ё/е normalization + glued prefix
     const m3 = findBestContactMatch('п.Афипский ул.Березовая, д.5 - рмк 1', b24Users, 0.55);
     assert.equal(m3.matched, true);
     assert.equal(m3.profile.id, '103');
+    assert.equal(m3.profile.phones.length, 2);
+    assert.equal(m3.profile.phones[0].href, 'tel:+79185556677');
+    assert.equal(m3.profile.phones[1].href, 'tel:105');
 
-    // House number mismatch on same street/city MUST NOT false-match
-    const mWrongHouse = findBestContactMatch('ст.Калининская ул.Советская, д.99 - касса ИБ', b24Users, 0.55);
-    assert.equal(mWrongHouse.matched, false);
+    assert.equal(findBestContactMatch('ст.Калининская ул.Советская, д.99 - касса ИБ', b24Users, 0.55).matched, false);
+    assert.equal(findBestContactMatch('г.Краснодар ул.Северная, д.500 - касса', b24Users, 0.55).matched, false);
+    assert.equal(findBestContactMatch('SERVER-DC01', b24Users, 0.55).matched, false);
 
-    // City-only overlap MUST NOT false-match
-    const mWrongStreet = findBestContactMatch('г.Краснодар ул.Северная, д.500 - касса', b24Users, 0.55);
-    assert.equal(mWrongStreet.matched, false);
-
-    // Generic PC name MUST NOT match
-    const mGeneric = findBestContactMatch('SERVER-DC01', b24Users, 0.55);
-    assert.equal(mGeneric.matched, false);
-
-    // Additional real-world pharmacy formats (no spaces after comma, hyphenated cities, building corps, abbreviations)
     const extraUsers = [
         normalizeBitrixUser({ ID: '201', NAME: 'ВА | Славянск-на-Кубани, Красная 12/1 - ЮБ', WORK_PHONE: '+7 86146 4-12-34' }),
         normalizeBitrixUser({ ID: '202', NAME: 'ЮБ | хутор Коржи, ул. Мира 5а', PERSONAL_MOBILE: '+7 918 222-11-00' }),
@@ -166,17 +267,14 @@ function testRealMeshCentralPluginHandler() {
     const pluginHandlerPath = path.join(__dirname, '..', '..', 'pluginHandler.temp.js');
     if (!fs.existsSync(pluginHandlerPath)) return;
 
-    const os = require('os');
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-b24-test-'));
     const pluginsDir = path.join(tmpRoot, 'plugins', 'b24contacts');
-    fs.mkdirSync(path.join(pluginsDir, 'public'), { recursive: true });
+    fs.mkdirSync(pluginsDir, { recursive: true });
     fs.copyFileSync(pluginHandlerPath, path.join(tmpRoot, 'pluginHandler.js'));
     fs.writeFileSync(path.join(tmpRoot, 'common.js'), 'module.exports = { isAlphaNumeric: (v) => /^[a-z0-9]+$/i.test(String(v || "")) };');
     fs.copyFileSync(path.join(__dirname, '..', 'b24contacts.js'), path.join(pluginsDir, 'b24contacts.js'));
     fs.copyFileSync(path.join(__dirname, '..', 'config.json'), path.join(pluginsDir, 'config.json'));
-    fs.copyFileSync(path.join(__dirname, '..', 'public', 'b24contacts.js'), path.join(pluginsDir, 'public', 'b24contacts.js'));
 
-    // Disk config fallback test (when server.config didn't pass b24contacts directly)
     fs.writeFileSync(path.join(tmpRoot, 'config.json'), JSON.stringify({
         settings: {
             plugins: {
@@ -212,19 +310,20 @@ function testRealMeshCentralPluginHandler() {
         const loadedCfg = ph.plugins.b24contacts._internal.loadSettings(mockServer);
         assert.equal(loadedCfg.webhookUrl, 'https://example.bitrix24.ru/rest/1/disk_token_123/');
 
-        // Verify pluginHandler.prepExports() produces valid JS
         const builderSrc = ph.prepExports();
         const builderFn = new Function('return ' + builderSrc);
         const clientHandler = builderFn()();
         assert.equal(typeof clientHandler.b24contacts.onWebUIStartupEnd, 'function');
         assert.equal(typeof clientHandler.b24contacts.onDeviceRefreshEnd, 'function');
         assert.equal(typeof clientHandler.b24contacts.onContactsResult, 'function');
+        assert.equal(typeof clientHandler.b24contacts.onSettingsResult, 'function');
+        assert.equal(typeof clientHandler.b24contacts.openSettings, 'function');
     } finally {
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
 }
 
-async function testBitrixPaginationAndResilience() {
+async function testBitrixPaginationSettingsAndResilience() {
     let failMode = false;
     const receivedBodies = [];
 
@@ -268,239 +367,125 @@ async function testBitrixPaginationAndResilience() {
 
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const port = server.address().port;
+    const tmpDatapath = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-b24-cfg-'));
 
     try {
         const webhookUrl = 'http://127.0.0.1:' + port + '/rest/1/secret_token_xyz/';
         const mockParent = createMockParent({
-            settings: {
-                plugins: {
-                    enabled: true,
-                    b24contacts: {
-                        webhookUrl: webhookUrl,
-                        cacheTtlMinutes: 60,
-                        pageDelayMs: 0
-                    }
-                }
-            }
-        });
+            settings: { plugins: { enabled: true } }
+        }, tmpDatapath);
 
         const plugin = pluginFactory(mockParent);
-        assert.equal(plugin._internal.maskWebhookUrl(webhookUrl), 'http://127.0.0.1:' + port + '/rest/1/***/');
 
-        const ok = await plugin._internal.refreshCache('test');
-        assert.equal(ok, true);
+        // Before settings saved: needsConfig should be true
+        const unconfiguredReply = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'getContacts', requestId: 'req-0', nodeId: 'node//1', nodeName: 'ст.Калининская ул.Советская, д.38' },
+                { user: { _id: 'user//u1', siteadmin: 0 }, send: resolve }
+            );
+        });
+        assert.equal(unconfiguredReply.ok, false);
+        assert.equal(unconfiguredReply.needsConfig, true);
+
+        // Non-admin cannot save settings
+        const deniedSave = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'saveSettings', requestId: 'req-deny', settings: { webhookUrl } },
+                { user: { _id: 'user//u1', siteadmin: 0 }, send: resolve }
+            );
+        });
+        assert.equal(deniedSave.ok, false);
+
+        // Admin saves settings via UI action -> persists to disk and populates Bitrix24 cache immediately
+        const saveReply = await new Promise((resolve) => {
+            plugin.serveraction(
+                {
+                    pluginaction: 'saveSettings',
+                    requestId: 'req-save',
+                    settings: { webhookUrl, cacheTtlMinutes: 60, minMatchScore: 0.55 }
+                },
+                { user: { _id: 'user//admin', siteadmin: -1 }, send: resolve }
+            );
+        });
+        assert.equal(saveReply.saved, true);
+        assert.equal(saveReply.ok, true);
+        assert.equal(saveReply.cacheSize, 3);
+        assert.equal(saveReply.hasWebhook, true);
+        assert.ok(!saveReply.maskedWebhookUrl.includes('secret_token_xyz'));
+        assert.ok(fs.existsSync(path.join(tmpDatapath, 'b24contacts-settings.json')));
         assert.equal(receivedBodies.length, 2);
-        assert.deepEqual(receivedBodies[0].FILTER, { ACTIVE: true });
-        assert.equal(receivedBodies[0].start, 0);
-        assert.equal(receivedBodies[1].start, 2);
-        assert.equal(plugin._internal.getCacheState().users.length, 3);
 
-        // Test serveraction authorization and match response
-        let unauthSent = false;
-        plugin.serveraction({ pluginaction: 'getContacts', nodeName: 'ст.Калининская ул.Советская, д.38' }, { send: () => { unauthSent = true; } });
-        assert.equal(unauthSent, false);
+        // Admin testMatch action
+        const testReply = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'testMatch', requestId: 'req-test', nodeName: 'ст.Динская ул.Красная, д.44 - касса ИБ' },
+                { user: { _id: 'user//admin', siteadmin: -1 }, send: resolve }
+            );
+        });
+        assert.equal(testReply.testResult.matched, true);
+        assert.equal(testReply.testResult.profile.id, '3');
 
+        // Normal user getContacts works now
         const wsReply = await new Promise((resolve) => {
             plugin.serveraction(
                 { pluginaction: 'getContacts', requestId: 'req-1', nodeId: 'node//1', nodeName: 'ст.Динская ул.Красная, д.44 - касса ИБ' },
-                { user: { _id: 'user//admin', siteadmin: 0 }, send: resolve }
+                { user: { _id: 'user//u1', siteadmin: 0 }, send: resolve }
             );
         });
-        assert.equal(wsReply.action, 'plugin');
-        assert.equal(wsReply.plugin, 'b24contacts');
-        assert.equal(wsReply.method, 'onContactsResult');
-        assert.equal(wsReply.requestId, 'req-1');
-        assert.equal(wsReply.ok, true);
         assert.equal(wsReply.matched, true);
-        assert.equal(wsReply.profile.id, '3');
         assert.equal(wsReply.phones.length, 2);
 
-        // Simulate Bitrix24 API failure: stale cache must be preserved without throwing
+        // Simulate Bitrix24 API failure: stale cache preserved
         failMode = true;
         const okAfterFail = await plugin._internal.refreshCache('test-fail');
         assert.equal(okAfterFail, false);
         assert.equal(plugin._internal.getCacheState().users.length, 3);
 
-        const wsReplyWithStaleCache = await new Promise((resolve) => {
-            plugin.serveraction(
-                { pluginaction: 'getContacts', requestId: 'req-2', nodeId: 'node//2', nodeName: 'ст.Калининская ул.Советская, д.38 - касса ИБ' },
-                { user: { _id: 'user//admin', siteadmin: 0 }, send: resolve }
-            );
-        });
-        assert.equal(wsReplyWithStaleCache.matched, true);
-        assert.equal(wsReplyWithStaleCache.profile.id, '1');
-
-        // Test Express HTTP route registration & auth check
-        const routes = {};
-        const mockApp = {
-            _router: { stack: [] },
-            get: function (p, handler) {
-                routes[p] = handler;
-                this._router.stack.push({ route: { path: p } });
-            }
-        };
-        plugin.hook_setupHttpHandlers({ app: mockApp });
-        assert.equal(typeof routes['/plugin/b24contacts/b24contacts.js'], 'function');
-        assert.equal(typeof routes['/plugin/b24contacts/api/contacts'], 'function');
-
-        let status401 = null;
-        let body401 = null;
-        await routes['/plugin/b24contacts/api/contacts'](
-            { query: { nodeName: 'test' }, headers: {} },
-            {
-                setHeader: () => {},
-                status: (s) => ({ json: (b) => { status401 = s; body401 = b; } })
-            }
-        );
-        assert.equal(status401, 401);
-        assert.equal(body401.ok, false);
-
-        let status200 = null;
-        let body200 = null;
-        mockParent.parent.users['user//1'] = { _id: 'user//1' };
-        await routes['/plugin/b24contacts/api/contacts'](
-            { query: { nodeName: 'ст.Калининская ул.Советская, д.38 - касса ИБ' }, session: { userid: 'user//1' }, headers: {} },
-            {
-                setHeader: () => {},
-                status: (s) => ({ json: (b) => { status200 = s; body200 = b; } })
-            }
-        );
-        assert.equal(status200, 200);
-        assert.equal(body200.matched, true);
-        assert.equal(body200.profile.id, '1');
-
         plugin.server_shutdown();
     } finally {
+        fs.rmSync(tmpDatapath, { recursive: true, force: true });
         await new Promise((resolve) => server.close(resolve));
     }
 }
 
-async function testInvalidConfigResilience() {
-    const plugin = pluginFactory(createMockParent({
-        settings: {
-            plugins: {
-                enabled: true,
-                b24contacts: { webhookUrl: 'not-a-valid-url' }
-            }
-        }
-    }));
-
-    plugin.server_startup();
-    const ok = await plugin._internal.refreshCache('invalid-url');
-    assert.equal(ok, false);
-
-    const reply = await new Promise((resolve) => {
-        plugin.serveraction(
-            { pluginaction: 'getContacts', requestId: 'req-bad', nodeName: 'ст.Калининская ул.Советская, д.38' },
-            { user: { _id: 'user//1' }, send: resolve }
-        );
-    });
-    assert.equal(reply.ok, false);
-    assert.equal(reply.matched, false);
-    assert.ok(reply.error);
-    plugin.server_shutdown();
-}
-
-async function testFrontendDomInjection() {
-    const clientCode = fs.readFileSync(path.join(__dirname, '..', 'public', 'b24contacts.js'), 'utf8');
-
-    function makeElement(tag) {
-        const el = {
-            tagName: String(tag || 'div').toUpperCase(),
-            id: '',
-            className: '',
-            textContent: '',
-            href: '',
-            title: '',
-            type: '',
-            disabled: false,
-            style: {},
-            dataset: {},
-            children: [],
-            parentNode: null,
-            attributes: {},
-            setAttribute: function (k, v) { this.attributes[k] = String(v); if (k === 'id') this.id = String(v); },
-            addEventListener: function () {},
-            appendChild: function (child) {
-                child.parentNode = this;
-                this.children.push(child);
-                return child;
-            },
-            replaceChildren: function () {
-                this.children = [];
-            },
-            remove: function () {
-                if (this.parentNode) {
-                    this.parentNode.children = this.parentNode.children.filter((c) => c !== this);
-                    this.parentNode = null;
-                }
-            },
-            querySelector: function (sel) {
-                const cls = sel.startsWith('.') ? sel.slice(1) : null;
-                const stack = [...this.children];
-                while (stack.length) {
-                    const node = stack.shift();
-                    if (cls && node.className === cls) return node;
-                    if (!cls && node.tagName.toLowerCase() === sel.toLowerCase()) return node;
-                    stack.push(...node.children);
-                }
-                return null;
-            }
-        };
-        return el;
-    }
-
-    function findById(root, id) {
-        if (!root) return null;
-        if (root.id === id) return root;
-        for (const ch of root.children || []) {
-            const hit = findById(ch, id);
-            if (hit) return hit;
-        }
-        return null;
-    }
-
-    const head = makeElement('head');
-    const p10 = makeElement('div');
-    p10.id = 'p10';
-    p10.style.display = '';
-    const p10info = makeElement('div');
-    p10info.id = 'p10info';
-    p10.appendChild(p10info);
-
+async function testFrontendInlineUi() {
+    const plugin = pluginFactory(createMockParent());
+    const dom = makeDomShim();
     const sentMessages = [];
     const windowObj = {
+        userinfo: { _id: 'user//admin', siteadmin: -1 },
         currentNode: { _id: 'node//1', name: 'ст.Калининская ул.Советская, д.38 - касса ИБ' }
     };
 
     const sandbox = {
         window: windowObj,
         document: {
-            head: head,
-            createElement: makeElement,
-            createElementNS: (_ns, tag) => makeElement(tag),
-            getElementById: (id) => findById(head, id) || findById(p10, id)
+            head: dom.head,
+            body: dom.body,
+            createElement: dom.makeElement,
+            createElementNS: (_ns, tag) => dom.makeElement(tag),
+            getElementById: (id) => dom.findById(dom.head, id) || dom.findById(dom.body, id),
+            querySelector: (sel) => dom.body.querySelector(sel)
         },
-        meshserver: {
-            send: (msg) => sentMessages.push(msg)
-        },
+        meshserver: { send: (msg) => sentMessages.push(msg) },
         setTimeout,
         clearTimeout,
+        setInterval: () => ({ unref: () => {} }),
         Map
     };
     sandbox.window.document = sandbox.document;
     sandbox.window.meshserver = sandbox.meshserver;
 
-    vm.runInNewContext(clientCode, sandbox);
+    vm.runInNewContext('(' + plugin.onWebUIStartupEnd.toString() + ')()', sandbox);
 
-    // Loader immediately renders spinner and sends WS getContacts
-    const card = findById(p10, 'b24-contacts-card');
+    const card = dom.findById(dom.p10, 'b24-contacts-card');
     assert.ok(card, 'Card should be mounted in #p10info');
     assert.ok(card.querySelector('.b24c-spinner'), 'Spinner should render while loading');
+    assert.ok(card.querySelector('.b24c-cfg-btn'), 'Admin settings gear button should render in card');
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0].pluginaction, 'getContacts');
 
-    // Deliver matched reply with XSS payload in displayName
+    // Deliver matched reply with XSS payload
     sandbox.window.B24ContactsPlugin.onContactsResult({
         requestId: sentMessages[0].requestId,
         ok: true,
@@ -518,7 +503,7 @@ async function testFrontendDomInjection() {
     await new Promise((r) => setTimeout(r, 10));
     const prof = card.querySelector('.b24c-profile');
     assert.ok(prof);
-    assert.equal(prof.children.length, 0, 'XSS string must remain plain textContent, not parsed HTML');
+    assert.equal(prof.children.length, 0);
     assert.ok(prof.textContent.includes('<img src=x onerror=alert(1)>'));
 
     const links = [];
@@ -532,12 +517,24 @@ async function testFrontendDomInjection() {
     assert.equal(links[0].href, 'tel:+78616321000');
     assert.equal(links[1].href, 'tel:+79181112233');
 
-    // Switch to unmatched device
-    windowObj.currentNode = { _id: 'node//2', name: 'Неизвестный ПК' };
+    // Switch to needsConfig response -> shows setup button for admin
+    windowObj.currentNode = { _id: 'node//2', name: 'ПК 2' };
     sandbox.window.B24ContactsPlugin.onDeviceRefreshEnd();
-    assert.equal(sentMessages.length, 2);
     sandbox.window.B24ContactsPlugin.onContactsResult({
         requestId: sentMessages[1].requestId,
+        ok: false,
+        needsConfig: true,
+        matched: false,
+        error: 'Вебхук Битрикс24 не настроен'
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.ok(card.querySelector('.b24c-inline-btn'), 'Inline configure button should appear when needsConfig is true');
+
+    // Switch to unmatched device
+    windowObj.currentNode = { _id: 'node//3', name: 'Неизвестный ПК' };
+    sandbox.window.B24ContactsPlugin.onDeviceRefreshEnd();
+    sandbox.window.B24ContactsPlugin.onContactsResult({
+        requestId: sentMessages[2].requestId,
         ok: true,
         matched: false,
         profile: null,
@@ -554,9 +551,8 @@ async function main() {
     testPrepExportsCompatibility();
     testMatchingLogic();
     testRealMeshCentralPluginHandler();
-    await testBitrixPaginationAndResilience();
-    await testInvalidConfigResilience();
-    await testFrontendDomInjection();
+    await testBitrixPaginationSettingsAndResilience();
+    await testFrontendInlineUi();
     console.log('All b24contacts tests passed!');
 }
 

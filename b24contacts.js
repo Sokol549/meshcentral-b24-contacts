@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 const PLUGIN_NAME = 'b24contacts';
@@ -106,12 +107,49 @@ function readDiskConfig(datapath) {
     }
 }
 
+function getSavedSettingsPath(server) {
+    if (!server || !server.datapath) return null;
+    return path.join(server.datapath, 'b24contacts-settings.json');
+}
+
+function readSavedSettings(server) {
+    var filePath = getSavedSettingsPath(server);
+    if (!filePath) return null;
+    try {
+        if (!fs.existsSync(filePath)) return null;
+        var parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        return (parsed && typeof parsed === 'object') ? parsed : null;
+    } catch (e) {
+        console.warn('[b24contacts] Не удалось прочитать сохранённые настройки:', e.message);
+        return null;
+    }
+}
+
+function writeSavedSettings(server, nextSettings) {
+    var filePath = getSavedSettingsPath(server);
+    if (!filePath) {
+        throw new Error('Каталог данных MeshCentral (datapath) недоступен для сохранения настроек');
+    }
+    var dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    var tmpPath = filePath + '.' + crypto.randomBytes(8).toString('hex') + '.tmp';
+    try {
+        fs.writeFileSync(tmpPath, JSON.stringify(nextSettings, null, 2), { mode: 0o600, flag: 'wx' });
+        fs.renameSync(tmpPath, filePath);
+    } finally {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+    }
+}
+
 function loadSettings(server) {
     var fromMemory = server && server.config ? extractPluginConfigFromObject(server.config) : null;
     var fromDisk = (!fromMemory || !fromMemory.webhookUrl) && server && server.datapath
         ? extractPluginConfigFromObject(readDiskConfig(server.datapath))
         : null;
-    var merged = Object.assign({}, fromDisk || {}, fromMemory || {});
+    var fromSaved = readSavedSettings(server);
+    var merged = Object.assign({}, fromDisk || {}, fromMemory || {}, fromSaved || {});
     var envUrl = (typeof process !== 'undefined' && process.env && process.env.B24_WEBHOOK_URL)
         ? String(process.env.B24_WEBHOOK_URL).trim()
         : '';
@@ -377,8 +415,25 @@ function normalizeBitrixUser(user) {
 
     var workPhone = cleanPhoneValue(user.WORK_PHONE);
     var mobilePhone = cleanPhoneValue(user.PERSONAL_MOBILE);
+    var personalPhone = cleanPhoneValue(user.PERSONAL_PHONE);
+    var innerPhone = cleanPhoneValue(user.UF_PHONE_INNER);
+
     var phones = extractPhonesList(workPhone, 'work', 'Рабочий')
         .concat(extractPhonesList(mobilePhone, 'mobile', 'Мобильный'));
+
+    var seenHrefs = new Set(phones.map(function (p) { return p.href; }));
+    extractPhonesList(personalPhone, 'mobile', 'Доп. телефон').forEach(function (p) {
+        if (!seenHrefs.has(p.href)) {
+            seenHrefs.add(p.href);
+            phones.push(p);
+        }
+    });
+    extractPhonesList(innerPhone, 'work', 'Внутренний').forEach(function (p) {
+        if (!seenHrefs.has(p.href)) {
+            seenHrefs.add(p.href);
+            phones.push(p);
+        }
+    });
 
     return {
         id: user.ID != null ? String(user.ID) : '',
@@ -723,8 +778,9 @@ function createPlugin(parent) {
         if (!settings.webhookUrl) {
             return {
                 ok: false,
+                needsConfig: true,
                 matched: false,
-                error: 'Вебхук Битрикс24 не настроен в config.json',
+                error: 'Вебхук Битрикс24 не настроен',
                 cacheSize: cache.users.length
             };
         }
@@ -752,6 +808,38 @@ function createPlugin(parent) {
         };
     }
 
+    function getSettingsSummary(settings) {
+        var s = settings || getSettings();
+        return {
+            hasWebhook: Boolean(s.webhookUrl),
+            maskedWebhookUrl: maskWebhookUrl(s.webhookUrl),
+            cacheTtlMinutes: s.cacheTtlMinutes,
+            minMatchScore: s.minMatchScore,
+            requestTimeoutMs: s.requestTimeoutMs,
+            rejectUnauthorized: s.rejectUnauthorized,
+            cacheSize: cache.users.length,
+            lastUpdated: cache.lastUpdated,
+            lastError: cache.lastError
+        };
+    }
+
+    function rescheduleRefreshTimer(settings) {
+        if (refreshTimer) {
+            clearInterval(refreshTimer);
+            refreshTimer = null;
+        }
+        var s = settings || getSettings();
+        var intervalMs = s.cacheTtlMinutes * 60 * 1000;
+        refreshTimer = setInterval(function () {
+            refreshCache('scheduled').catch(function (err) {
+                console.error('[b24contacts] Ошибка планового обновления кеша:', err && err.message);
+            });
+        }, intervalMs);
+        if (refreshTimer && typeof refreshTimer.unref === 'function') {
+            refreshTimer.unref();
+        }
+    }
+
     function getExpressApp() {
         var server = getServer();
         if (!server) return null;
@@ -762,22 +850,6 @@ function createPlugin(parent) {
         if (!app || typeof app.get !== 'function') return false;
         if (app._b24ContactsRoutesRegistered) return true;
         app._b24ContactsRoutesRegistered = true;
-
-        var clientJsPath = path.join(__dirname, 'public', 'b24contacts.js');
-
-        app.get('/plugin/b24contacts/b24contacts.js', function (req, res) {
-            try {
-                res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-                res.setHeader('Cache-Control', 'no-cache');
-                if (fs.existsSync(clientJsPath)) {
-                    res.sendFile(clientJsPath);
-                } else {
-                    res.status(404).send('// b24contacts client script not found');
-                }
-            } catch (e) {
-                res.status(500).send('// error serving b24contacts.js');
-            }
-        });
 
         app.get('/plugin/b24contacts/api/contacts', async function (req, res) {
             try {
@@ -872,15 +944,7 @@ function createPlugin(parent) {
                 console.error('[b24contacts] Непредвиденная ошибка стартового обновления кеша:', err && err.message);
             });
 
-            var intervalMs = settings.cacheTtlMinutes * 60 * 1000;
-            refreshTimer = setInterval(function () {
-                refreshCache('scheduled').catch(function (err) {
-                    console.error('[b24contacts] Ошибка планового обновления кеша:', err && err.message);
-                });
-            }, intervalMs);
-            if (refreshTimer && typeof refreshTimer.unref === 'function') {
-                refreshTimer.unref();
-            }
+            rescheduleRefreshTimer(settings);
         } catch (err) {
             console.error('[b24contacts] Ошибка инициализации server_startup:', err.message);
         }
@@ -901,9 +965,9 @@ function createPlugin(parent) {
     obj.serveraction = function (command, client) {
         if (!command || !client || !client.user) return;
         var action = command.pluginaction;
+        var requestId = typeof command.requestId === 'string' ? command.requestId : '';
 
         if (action === 'getContacts') {
-            var requestId = typeof command.requestId === 'string' ? command.requestId : '';
             var nodeId = typeof command.nodeId === 'string' ? command.nodeId : '';
             var nodeName = typeof command.nodeName === 'string' ? command.nodeName.slice(0, 512) : '';
 
@@ -969,35 +1033,159 @@ function createPlugin(parent) {
             return;
         }
 
+        if (action === 'getSettings') {
+            if (!isUserAdmin(client.user)) {
+                sendToClient(client, {
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onSettingsResult',
+                    requestId: requestId,
+                    ok: false,
+                    error: 'Требуются права администратора MeshCentral'
+                });
+                return;
+            }
+            sendToClient(client, Object.assign({
+                action: 'plugin',
+                plugin: PLUGIN_NAME,
+                method: 'onSettingsResult',
+                requestId: requestId,
+                ok: true
+            }, getSettingsSummary()));
+            return;
+        }
+
+        if (action === 'saveSettings') {
+            if (!isUserAdmin(client.user)) {
+                sendToClient(client, {
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onSettingsResult',
+                    requestId: requestId,
+                    ok: false,
+                    error: 'Требуются права администратора MeshCentral'
+                });
+                return;
+            }
+            (async function () {
+                try {
+                    var incoming = (command.settings && typeof command.settings === 'object') ? command.settings : {};
+                    var current = getSettings();
+                    var rawUrl = typeof incoming.webhookUrl === 'string' ? incoming.webhookUrl.trim() : '';
+                    var nextWebhookUrl = rawUrl || current.webhookUrl;
+                    if (incoming.clearWebhook === true) {
+                        nextWebhookUrl = '';
+                    }
+                    if (nextWebhookUrl) {
+                        buildUserGetUrl(nextWebhookUrl);
+                    }
+                    var nextSettings = {
+                        webhookUrl: nextWebhookUrl,
+                        cacheTtlMinutes: clampNumber(incoming.cacheTtlMinutes, current.cacheTtlMinutes, 5, 1440),
+                        minMatchScore: clampNumber(incoming.minMatchScore, current.minMatchScore, 0.2, 0.95),
+                        requestTimeoutMs: clampNumber(incoming.requestTimeoutMs, current.requestTimeoutMs, 2000, 60000),
+                        pageDelayMs: current.pageDelayMs,
+                        rejectUnauthorized: incoming.rejectUnauthorized !== false
+                    };
+                    writeSavedSettings(getServer(), nextSettings);
+                    rescheduleRefreshTimer(nextSettings);
+
+                    var ok = false;
+                    if (nextSettings.webhookUrl) {
+                        ok = await refreshCache('settings-saved');
+                    } else {
+                        cache.users = [];
+                        cache.lastUpdated = 0;
+                        cache.lastError = 'URL вебхука Битрикс24 не настроен';
+                    }
+
+                    sendToClient(client, Object.assign({
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onSettingsResult',
+                        requestId: requestId,
+                        saved: true,
+                        ok: nextSettings.webhookUrl ? ok : true,
+                        error: nextSettings.webhookUrl && !ok ? cache.lastError : null
+                    }, getSettingsSummary(nextSettings)));
+                } catch (err) {
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onSettingsResult',
+                        requestId: requestId,
+                        saved: false,
+                        ok: false,
+                        error: err && err.message ? err.message : 'Не удалось сохранить настройки'
+                    });
+                }
+            })();
+            return;
+        }
+
+        if (action === 'testMatch') {
+            if (!isUserAdmin(client.user)) {
+                sendToClient(client, {
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onSettingsResult',
+                    requestId: requestId,
+                    ok: false,
+                    error: 'Требуются права администратора MeshCentral'
+                });
+                return;
+            }
+            var testName = typeof command.nodeName === 'string' ? command.nodeName.slice(0, 512) : '';
+            lookupContacts(testName).then(function (result) {
+                sendToClient(client, Object.assign({
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onSettingsResult',
+                    requestId: requestId,
+                    testResult: result
+                }, getSettingsSummary()));
+            }).catch(function (err) {
+                sendToClient(client, {
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onSettingsResult',
+                    requestId: requestId,
+                    ok: false,
+                    error: err && err.message
+                });
+            });
+            return;
+        }
+
         if (action === 'refreshCache') {
             if (!isUserAdmin(client.user)) {
                 sendToClient(client, {
                     action: 'plugin',
                     plugin: PLUGIN_NAME,
-                    method: 'onContactsResult',
-                    requestId: typeof command.requestId === 'string' ? command.requestId : '',
+                    method: 'onSettingsResult',
+                    requestId: requestId,
                     ok: false,
                     error: 'Требуются права администратора MeshCentral'
                 });
                 return;
             }
             refreshCache('manual').then(function (ok) {
-                sendToClient(client, {
+                var payload = Object.assign({
                     action: 'plugin',
                     plugin: PLUGIN_NAME,
-                    method: 'onContactsResult',
-                    requestId: typeof command.requestId === 'string' ? command.requestId : '',
+                    method: 'onSettingsResult',
+                    requestId: requestId,
                     refreshed: true,
                     ok: ok,
-                    cacheSize: cache.users.length,
                     error: ok ? null : cache.lastError
-                });
+                }, getSettingsSummary());
+                sendToClient(client, payload);
             }).catch(function (err) {
                 sendToClient(client, {
                     action: 'plugin',
                     plugin: PLUGIN_NAME,
-                    method: 'onContactsResult',
-                    requestId: typeof command.requestId === 'string' ? command.requestId : '',
+                    method: 'onSettingsResult',
+                    requestId: requestId,
                     refreshed: true,
                     ok: false,
                     error: err && err.message
@@ -1017,19 +1205,774 @@ function createPlugin(parent) {
         buildUserGetUrl: buildUserGetUrl,
         maskWebhookUrl: maskWebhookUrl,
         loadSettings: loadSettings,
+        writeSavedSettings: writeSavedSettings,
         refreshCache: refreshCache,
         getCacheState: function () { return cache; }
     };
 
     // Browser-serialized hooks (MUST NOT reference Node closure variables)
-    obj.exports = ['onWebUIStartupEnd', 'onDeviceRefreshEnd', 'onContactsResult'];
+    obj.exports = ['onWebUIStartupEnd', 'onDeviceRefreshEnd', 'onContactsResult', 'onSettingsResult', 'openSettings'];
 
     obj.onWebUIStartupEnd = function () {
-        if (document.getElementById('b24contacts-loader')) return;
-        var s = document.createElement('script');
-        s.id = 'b24contacts-loader';
-        s.src = 'plugin/b24contacts/b24contacts.js';
-        document.head.appendChild(s);
+        if (window.B24ContactsPlugin) {
+            window.B24ContactsPlugin.inject();
+            return;
+        }
+
+        var PLUGIN = 'b24contacts';
+        var CARD_ID = 'b24-contacts-card';
+        var STYLE_ID = 'b24-contacts-style';
+        var ACCOUNT_LINK_ID = 'plugin_b24contactsSettings';
+        var MODAL_ID = 'b24c-settings-overlay';
+        var FRONTEND_CACHE_TTL_MS = 5 * 60 * 1000;
+        var WS_TIMEOUT_MS = 8000;
+
+        var pendingContacts = new Map();
+        var pendingSettings = new Map();
+        var responseCache = new Map();
+        var requestSeq = 0;
+
+        function isCurrentUserAdmin() {
+            var u = window.userinfo;
+            if (!u) return false;
+            if (u.siteadmin === -1 || u.siteadmin === 0xFFFFFFFF || u.siteadmin === true) return true;
+            if (typeof u.siteadmin === 'number' && (u.siteadmin & 1) !== 0) return true;
+            return false;
+        }
+
+        function injectStyles() {
+            if (document.getElementById(STYLE_ID)) return;
+            var style = document.createElement('style');
+            style.id = STYLE_ID;
+            style.textContent = [
+                '#' + CARD_ID + '{clear:both;margin:10px 0 12px;padding:11px 14px;border:1px solid #d5dce6;border-radius:6px;background:rgba(248,250,252,0.95);color:#1e293b;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;box-sizing:border-box;max-width:680px}',
+                '#' + CARD_ID + ' .b24c-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #e2e8f0}',
+                '#' + CARD_ID + ' .b24c-title{margin:0;font-size:13px;font-weight:700;color:#0f172a;display:flex;align-items:center;gap:6px}',
+                '#' + CARD_ID + ' .b24c-actions{display:flex;align-items:center;gap:4px}',
+                '#' + CARD_ID + ' .b24c-icon-btn{background:transparent;border:1px solid #cbd5e1;border-radius:4px;color:#475569;cursor:pointer;font-size:12px;line-height:1;padding:3px 7px}',
+                '#' + CARD_ID + ' .b24c-icon-btn:hover{background:#e2e8f0;color:#0f172a}',
+                '#' + CARD_ID + ' .b24c-icon-btn:disabled{opacity:0.5;cursor:default}',
+                '#' + CARD_ID + ' .b24c-loader-wrap{display:flex;align-items:center;gap:8px;color:#64748b;padding:2px 0}',
+                '#' + CARD_ID + ' .b24c-spinner{width:14px;height:14px;border:2px solid #cbd5e1;border-top-color:#2563eb;border-radius:50%;animation:b24c-spin 0.8s linear infinite;flex-shrink:0}',
+                '#' + CARD_ID + ' .b24c-profile{font-size:12px;color:#475569;margin-bottom:6px;word-break:break-word}',
+                '#' + CARD_ID + ' .b24c-phones{display:flex;flex-direction:column;gap:6px}',
+                '#' + CARD_ID + ' .b24c-phone-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap}',
+                '#' + CARD_ID + ' .b24c-icon{width:15px;height:15px;flex-shrink:0;color:#2563eb}',
+                '#' + CARD_ID + ' .b24c-label{color:#64748b;font-size:12px;min-width:86px}',
+                '#' + CARD_ID + ' .b24c-link{color:#1d4ed8;font-weight:600;text-decoration:none}',
+                '#' + CARD_ID + ' .b24c-link:hover{text-decoration:underline}',
+                '#' + CARD_ID + ' .b24c-muted{color:#6b7280;font-size:12px}',
+                '#' + CARD_ID + ' .b24c-error{color:#b91c1c;font-size:12px}',
+                '#' + CARD_ID + ' .b24c-inline-btn{margin-top:6px;background:#1769f5;color:#fff;border:1px solid #1769f5;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer}',
+                '#' + CARD_ID + ' .b24c-inline-btn:hover{background:#0758d8}',
+                '#' + MODAL_ID + '{position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(14,25,43,.58);box-sizing:border-box}',
+                '#' + MODAL_ID + ' form{box-sizing:border-box;width:min(620px,100%);max-height:calc(100vh - 36px);overflow:auto;background:#fff;color:#202a35;border-radius:7px;box-shadow:0 16px 48px #0005;font:14px Arial,sans-serif}',
+                '#' + MODAL_ID + ' *{box-sizing:border-box}',
+                '#' + MODAL_ID + ' .b24c-m-header{padding:16px 22px 12px;border-bottom:1px solid #dfe5ed}',
+                '#' + MODAL_ID + ' .b24c-m-header h2{margin:0;font-size:19px}',
+                '#' + MODAL_ID + ' .b24c-m-sub{margin:4px 0 0;color:#5c6a7a;font-size:12px}',
+                '#' + MODAL_ID + ' .b24c-m-body{padding:14px 22px;display:flex;flex-direction:column;gap:12px}',
+                '#' + MODAL_ID + ' .b24c-m-card{padding:12px 14px;border:1px solid #dfe5ed;border-radius:5px;background:#f8fafc}',
+                '#' + MODAL_ID + ' label{display:block;color:#334155;font-size:12px;font-weight:600;margin-bottom:8px}',
+                '#' + MODAL_ID + ' label:last-child{margin-bottom:0}',
+                '#' + MODAL_ID + ' input:not([type=checkbox]){display:block;width:100%;height:31px;margin:4px 0 0;padding:5px 8px;border:1px solid #b9c4d2;border-radius:3px;background:#fff;color:#202a35;font:13px Arial,sans-serif}',
+                '#' + MODAL_ID + ' input:focus{outline:2px solid #90bcff;border-color:#1769f5}',
+                '#' + MODAL_ID + ' .b24c-m-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}',
+                '#' + MODAL_ID + ' .b24c-m-check{display:flex;align-items:center;gap:6px;font-weight:400;margin-top:8px}',
+                '#' + MODAL_ID + ' .b24c-m-note{margin:4px 0 8px;color:#5c6a7a;font-size:12px;word-break:break-all}',
+                '#' + MODAL_ID + ' .b24c-m-test-row{display:flex;gap:8px;align-items:center}',
+                '#' + MODAL_ID + ' .b24c-m-test-row input{flex:1;margin:0}',
+                '#' + MODAL_ID + ' .b24c-m-test-out{margin-top:8px;font-size:12px;color:#1e293b;white-space:pre-wrap}',
+                '#' + MODAL_ID + ' .b24c-m-footer{padding:10px 22px 14px;border-top:1px solid #e5eaf0;display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+                '#' + MODAL_ID + ' .b24c-m-status{flex:1;min-width:160px;margin:0;color:#40536b;font-size:12px}',
+                '#' + MODAL_ID + ' button:not(.b24c-m-primary){background:#fff;color:#285580;border:1px solid #b9c9dc;border-radius:3px;padding:6px 10px;cursor:pointer;font:13px Arial,sans-serif}',
+                '#' + MODAL_ID + ' button:not(.b24c-m-primary):hover{background:#edf4ff}',
+                '#' + MODAL_ID + ' .b24c-m-primary{background:#1769f5;color:#fff;border:1px solid #1769f5;border-radius:3px;padding:6px 12px;cursor:pointer;font:13px Arial,sans-serif}',
+                '#' + MODAL_ID + ' .b24c-m-primary:hover{background:#0758d8}',
+                '@keyframes b24c-spin{to{transform:rotate(360deg)}}',
+                '@media(max-width:600px){#' + MODAL_ID + ' .b24c-m-grid{grid-template-columns:1fr}}'
+            ].join('\n');
+            document.head.appendChild(style);
+        }
+
+        function createSvgIcon(kind) {
+            var ns = 'http://www.w3.org/2000/svg';
+            var svg = document.createElementNS(ns, 'svg');
+            svg.setAttribute('viewBox', '0 0 24 24');
+            svg.setAttribute('fill', 'none');
+            svg.setAttribute('stroke', 'currentColor');
+            svg.setAttribute('stroke-width', '2');
+            svg.setAttribute('stroke-linecap', 'round');
+            svg.setAttribute('stroke-linejoin', 'round');
+            svg.setAttribute('class', 'b24c-icon');
+            svg.setAttribute('aria-hidden', 'true');
+
+            if (kind === 'mobile') {
+                var rect = document.createElementNS(ns, 'rect');
+                rect.setAttribute('x', '6');
+                rect.setAttribute('y', '2');
+                rect.setAttribute('width', '12');
+                rect.setAttribute('height', '20');
+                rect.setAttribute('rx', '2');
+                rect.setAttribute('ry', '2');
+                var dot = document.createElementNS(ns, 'line');
+                dot.setAttribute('x1', '12');
+                dot.setAttribute('y1', '18');
+                dot.setAttribute('x2', '12.01');
+                dot.setAttribute('y2', '18');
+                svg.appendChild(rect);
+                svg.appendChild(dot);
+            } else {
+                var p = document.createElementNS(ns, 'path');
+                p.setAttribute('d', 'M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z');
+                svg.appendChild(p);
+            }
+            return svg;
+        }
+
+        function isSummaryVisible() {
+            var p10 = document.getElementById('p10');
+            if (!p10) return true;
+            return p10.style.display !== 'none';
+        }
+
+        function getTargetContainer() {
+            return (
+                document.getElementById('p10info') ||
+                document.getElementById('p10html3') ||
+                document.getElementById('p10html') ||
+                document.getElementById('p10')
+            );
+        }
+
+        function ensureAccountLink() {
+            if (!isCurrentUserAdmin()) return;
+            var host = document.querySelector('#p2AccountActions > p.mL') || document.getElementById('p2AccountActions');
+            if (!host || document.getElementById(ACCOUNT_LINK_ID)) return;
+
+            var wrap = document.createElement('span');
+            wrap.id = ACCOUNT_LINK_ID;
+            wrap.style.display = 'block';
+
+            var link = document.createElement('a');
+            link.href = '#';
+            link.textContent = 'Настройка Битрикс24 (Контакты)';
+            link.onclick = function (e) {
+                if (e && e.preventDefault) e.preventDefault();
+                openSettingsModal();
+                return false;
+            };
+
+            wrap.appendChild(link);
+            host.appendChild(wrap);
+        }
+
+        function ensureCardElement(node) {
+            injectStyles();
+            var container = getTargetContainer();
+            if (!container) return null;
+
+            var card = document.getElementById(CARD_ID);
+            if (card && card.parentNode !== container) {
+                card.remove();
+                card = null;
+            }
+            if (!card) {
+                card = document.createElement('div');
+                card.id = CARD_ID;
+
+                var header = document.createElement('div');
+                header.className = 'b24c-header';
+
+                var title = document.createElement('div');
+                title.className = 'b24c-title';
+                title.textContent = 'Контакты аптеки (Битрикс24)';
+
+                var actions = document.createElement('div');
+                actions.className = 'b24c-actions';
+
+                if (isCurrentUserAdmin()) {
+                    var cfgBtn = document.createElement('button');
+                    cfgBtn.type = 'button';
+                    cfgBtn.className = 'b24c-icon-btn b24c-cfg-btn';
+                    cfgBtn.title = 'Настройки подключения Битрикс24';
+                    cfgBtn.textContent = '⚙';
+                    cfgBtn.onclick = function () { openSettingsModal(); };
+                    actions.appendChild(cfgBtn);
+                }
+
+                var refreshBtn = document.createElement('button');
+                refreshBtn.type = 'button';
+                refreshBtn.className = 'b24c-icon-btn b24c-refresh';
+                refreshBtn.title = 'Обновить контакты';
+                refreshBtn.textContent = '↻';
+                refreshBtn.onclick = function () {
+                    if (window.currentNode) {
+                        loadContactsForNode(window.currentNode, true);
+                    }
+                };
+                actions.appendChild(refreshBtn);
+
+                header.appendChild(title);
+                header.appendChild(actions);
+
+                var body = document.createElement('div');
+                body.className = 'b24c-body';
+
+                card.appendChild(header);
+                card.appendChild(body);
+                container.appendChild(card);
+            }
+
+            if (node) {
+                card.dataset.nodeId = node._id || '';
+                card.dataset.nodeName = node.name || '';
+            }
+            return card;
+        }
+
+        function setRefreshBusy(card, busy) {
+            if (!card) return;
+            var btn = card.querySelector('.b24c-refresh');
+            if (btn) btn.disabled = !!busy;
+        }
+
+        function renderLoading(node) {
+            var card = ensureCardElement(node);
+            if (!card) return;
+            setRefreshBusy(card, true);
+
+            var body = card.querySelector('.b24c-body');
+            body.replaceChildren();
+
+            var wrap = document.createElement('div');
+            wrap.className = 'b24c-loader-wrap';
+
+            var spinner = document.createElement('span');
+            spinner.className = 'b24c-spinner';
+            spinner.setAttribute('aria-hidden', 'true');
+
+            var text = document.createElement('span');
+            text.textContent = 'Поиск контактов в Битрикс24...';
+
+            wrap.appendChild(spinner);
+            wrap.appendChild(text);
+            body.appendChild(wrap);
+        }
+
+        function isSafeTelHref(href) {
+            return typeof href === 'string' && /^tel:[+\d*#]+$/.test(href);
+        }
+
+        function renderResult(node, data) {
+            var card = ensureCardElement(node);
+            if (!card) return;
+            setRefreshBusy(card, false);
+
+            var body = card.querySelector('.b24c-body');
+            body.replaceChildren();
+
+            if (!data || data.ok === false) {
+                var errEl = document.createElement('div');
+                errEl.className = (data && data.needsConfig) ? 'b24c-muted' : 'b24c-error';
+                errEl.textContent = (data && data.error) ? data.error : 'Не удалось загрузить контакты Битрикс24';
+                body.appendChild(errEl);
+
+                if (data && data.needsConfig && isCurrentUserAdmin()) {
+                    var setupBtn = document.createElement('button');
+                    setupBtn.type = 'button';
+                    setupBtn.className = 'b24c-inline-btn';
+                    setupBtn.textContent = 'Настроить подключение Битрикс24';
+                    setupBtn.onclick = function () { openSettingsModal(); };
+                    body.appendChild(setupBtn);
+                }
+                return;
+            }
+
+            if (!data.matched || !data.profile) {
+                var emptyEl = document.createElement('div');
+                emptyEl.className = 'b24c-muted';
+                emptyEl.textContent = 'Связанный профиль в Битрикс24 не найден';
+                body.appendChild(emptyEl);
+                return;
+            }
+
+            if (data.profile.displayName) {
+                var profEl = document.createElement('div');
+                profEl.className = 'b24c-profile';
+                profEl.textContent = data.profile.displayName;
+                body.appendChild(profEl);
+            }
+
+            var phones = Array.isArray(data.phones) ? data.phones : [];
+            if (phones.length === 0) {
+                var noPhones = document.createElement('div');
+                noPhones.className = 'b24c-muted';
+                noPhones.textContent = 'Профиль найден, но номера телефонов не указаны';
+                body.appendChild(noPhones);
+                return;
+            }
+
+            var list = document.createElement('div');
+            list.className = 'b24c-phones';
+
+            for (var i = 0; i < phones.length; i++) {
+                var phone = phones[i];
+                if (!phone || !phone.display) continue;
+
+                var row = document.createElement('div');
+                row.className = 'b24c-phone-row';
+
+                var icon = createSvgIcon(phone.type === 'mobile' ? 'mobile' : 'work');
+                var label = document.createElement('span');
+                label.className = 'b24c-label';
+                label.textContent = (phone.label || (phone.type === 'mobile' ? 'Мобильный' : 'Рабочий')) + ':';
+
+                row.appendChild(icon);
+                row.appendChild(label);
+
+                if (isSafeTelHref(phone.href)) {
+                    var link = document.createElement('a');
+                    link.className = 'b24c-link';
+                    link.href = phone.href;
+                    link.textContent = phone.display;
+                    row.appendChild(link);
+                } else {
+                    var span = document.createElement('span');
+                    span.textContent = phone.display;
+                    row.appendChild(span);
+                }
+
+                list.appendChild(row);
+            }
+
+            body.appendChild(list);
+        }
+
+        function sendPluginAction(pluginaction, extra, pendingMap) {
+            return new Promise(function (resolve, reject) {
+                if (typeof meshserver === 'undefined' || !meshserver || typeof meshserver.send !== 'function') {
+                    return reject(new Error('WebSocket MeshCentral недоступен'));
+                }
+                var requestId = 'b24c_' + Date.now() + '_' + (++requestSeq);
+                var timer = setTimeout(function () {
+                    pendingMap.delete(requestId);
+                    reject(new Error('Таймаут ответа сервера MeshCentral'));
+                }, WS_TIMEOUT_MS);
+
+                pendingMap.set(requestId, {
+                    resolve: function (msg) {
+                        clearTimeout(timer);
+                        resolve(msg);
+                    }
+                });
+
+                try {
+                    meshserver.send(Object.assign({
+                        action: 'plugin',
+                        plugin: PLUGIN,
+                        pluginaction: pluginaction,
+                        requestId: requestId
+                    }, extra || {}));
+                } catch (err) {
+                    clearTimeout(timer);
+                    pendingMap.delete(requestId);
+                    reject(err);
+                }
+            });
+        }
+
+        function loadContactsForNode(node, forceRefresh) {
+            if (!node || !node._id) return;
+            if (!isSummaryVisible()) return;
+            if (!getTargetContainer()) return;
+
+            var nodeName = typeof node.name === 'string' ? node.name : '';
+            var key = node._id + '|' + nodeName;
+            var existingCard = document.getElementById(CARD_ID);
+
+            if (!forceRefresh && existingCard && existingCard.dataset.nodeId === (node._id || '') && existingCard.dataset.nodeName === nodeName) {
+                return;
+            }
+
+            if (!forceRefresh && responseCache.has(key)) {
+                var cached = responseCache.get(key);
+                if ((Date.now() - cached.ts) < FRONTEND_CACHE_TTL_MS) {
+                    renderResult(node, cached.data);
+                    return;
+                }
+                responseCache.delete(key);
+            }
+
+            renderLoading(node);
+
+            sendPluginAction('getContacts', { nodeId: node._id || '', nodeName: nodeName }, pendingContacts)
+                .then(function (data) {
+                    if (data && data.ok !== false) {
+                        responseCache.set(key, { ts: Date.now(), data: data });
+                    }
+                    var activeNode = window.currentNode;
+                    var activeKey = activeNode ? (activeNode._id + '|' + (activeNode.name || '')) : '';
+                    if (activeKey && activeKey !== key) return;
+                    renderResult(activeNode || node, data);
+                })
+                .catch(function (err) {
+                    var activeNode = window.currentNode;
+                    var activeKey = activeNode ? (activeNode._id + '|' + (activeNode.name || '')) : '';
+                    if (activeKey && activeKey !== key) return;
+                    renderResult(activeNode || node, {
+                        ok: false,
+                        matched: false,
+                        error: (err && err.message) ? err.message : 'Ошибка запроса к серверу MeshCentral'
+                    });
+                });
+        }
+
+        function formatStatusLine(msg) {
+            var updated = msg.lastUpdated ? new Date(msg.lastUpdated).toLocaleString() : 'не обновлялся';
+            var line = 'Профилей в кеше: ' + (msg.cacheSize || 0) + ' · Обновлён: ' + updated;
+            if (msg.lastError) line += ' · Ошибка: ' + msg.lastError;
+            return line;
+        }
+
+        function openSettingsModal() {
+            injectStyles();
+            if (document.getElementById(MODAL_ID)) return;
+
+            var overlay = document.createElement('div');
+            overlay.id = MODAL_ID;
+            overlay.setAttribute('role', 'dialog');
+            overlay.setAttribute('aria-modal', 'true');
+            ['keydown', 'keypress', 'keyup'].forEach(function (type) {
+                overlay.addEventListener(type, function (e) { e.stopPropagation(); });
+            });
+
+            var form = document.createElement('form');
+
+            var header = document.createElement('div');
+            header.className = 'b24c-m-header';
+            var h2 = document.createElement('h2');
+            h2.textContent = 'Настройка Битрикс24 (Контакты аптек)';
+            var sub = document.createElement('p');
+            sub.className = 'b24c-m-sub';
+            sub.textContent = 'Загрузка состояния кеша...';
+            header.appendChild(h2);
+            header.appendChild(sub);
+
+            var body = document.createElement('div');
+            body.className = 'b24c-m-body';
+
+            var connCard = document.createElement('section');
+            connCard.className = 'b24c-m-card';
+
+            var webhookLabel = document.createElement('label');
+            webhookLabel.textContent = 'URL входящего вебхука Битрикс24';
+            var webhookInput = document.createElement('input');
+            webhookInput.type = 'url';
+            webhookInput.name = 'webhookUrl';
+            webhookInput.placeholder = 'https://portal.bitrix24.ru/rest/1/ваш_токен/';
+            webhookInput.autocomplete = 'off';
+            webhookLabel.appendChild(webhookInput);
+
+            var currentWebhookNote = document.createElement('p');
+            currentWebhookNote.className = 'b24c-m-note';
+            currentWebhookNote.textContent = 'Текущий вебхук: не настроен';
+
+            var grid = document.createElement('div');
+            grid.className = 'b24c-m-grid';
+
+            function makeNumField(labelText, name, min, max, step, defVal) {
+                var lbl = document.createElement('label');
+                lbl.textContent = labelText;
+                var inp = document.createElement('input');
+                inp.type = 'number';
+                inp.name = name;
+                inp.min = String(min);
+                inp.max = String(max);
+                if (step) inp.step = String(step);
+                inp.value = String(defVal);
+                lbl.appendChild(inp);
+                return { lbl: lbl, inp: inp };
+            }
+
+            var ttlField = makeNumField('Обновление кеша (мин)', 'cacheTtlMinutes', 5, 1440, 1, 90);
+            var scoreField = makeNumField('Порог совпадения', 'minMatchScore', 0.2, 0.95, 0.05, 0.55);
+            var timeoutField = makeNumField('Таймаут (мс)', 'requestTimeoutMs', 2000, 60000, 500, 15000);
+            grid.appendChild(ttlField.lbl);
+            grid.appendChild(scoreField.lbl);
+            grid.appendChild(timeoutField.lbl);
+
+            var sslLabel = document.createElement('label');
+            sslLabel.className = 'b24c-m-check';
+            var sslInput = document.createElement('input');
+            sslInput.type = 'checkbox';
+            sslInput.name = 'rejectUnauthorized';
+            sslInput.checked = true;
+            var sslText = document.createElement('span');
+            sslText.textContent = 'Проверять SSL-сертификат (TLS)';
+            sslLabel.appendChild(sslInput);
+            sslLabel.appendChild(sslText);
+
+            connCard.appendChild(webhookLabel);
+            connCard.appendChild(currentWebhookNote);
+            connCard.appendChild(grid);
+            connCard.appendChild(sslLabel);
+
+            var testCard = document.createElement('section');
+            testCard.className = 'b24c-m-card';
+            var testLabel = document.createElement('label');
+            testLabel.textContent = 'Проверка сопоставления по имени ПК';
+            var testRow = document.createElement('div');
+            testRow.className = 'b24c-m-test-row';
+            var testInput = document.createElement('input');
+            testInput.type = 'text';
+            testInput.placeholder = 'Например: ст.Калининская ул.Советская, д.38 - касса ИБ';
+            if (window.currentNode && window.currentNode.name) {
+                testInput.value = window.currentNode.name;
+            }
+            var testBtn = document.createElement('button');
+            testBtn.type = 'button';
+            testBtn.textContent = 'Проверить';
+            testRow.appendChild(testInput);
+            testRow.appendChild(testBtn);
+            var testOut = document.createElement('div');
+            testOut.className = 'b24c-m-test-out';
+            testCard.appendChild(testLabel);
+            testCard.appendChild(testRow);
+            testCard.appendChild(testOut);
+
+            body.appendChild(connCard);
+            body.appendChild(testCard);
+
+            var footer = document.createElement('div');
+            footer.className = 'b24c-m-footer';
+            var status = document.createElement('p');
+            status.className = 'b24c-m-status';
+            status.setAttribute('role', 'status');
+            status.textContent = 'Загрузка текущих настроек...';
+
+            var refreshNowBtn = document.createElement('button');
+            refreshNowBtn.type = 'button';
+            refreshNowBtn.textContent = 'Обновить кеш';
+
+            var closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.textContent = 'Закрыть';
+
+            var saveBtn = document.createElement('button');
+            saveBtn.type = 'submit';
+            saveBtn.className = 'b24c-m-primary';
+            saveBtn.textContent = 'Сохранить и синхронизировать';
+
+            footer.appendChild(status);
+            footer.appendChild(refreshNowBtn);
+            footer.appendChild(closeBtn);
+            footer.appendChild(saveBtn);
+
+            form.appendChild(header);
+            form.appendChild(body);
+            form.appendChild(footer);
+            overlay.appendChild(form);
+            document.body.appendChild(overlay);
+
+            function applyState(msg) {
+                if (!msg) return;
+                sub.textContent = formatStatusLine(msg);
+                currentWebhookNote.textContent = msg.hasWebhook
+                    ? ('Текущий вебхук: ' + msg.maskedWebhookUrl + ' (оставьте поле пустым, чтобы не менять)')
+                    : 'Текущий вебхук: не настроен';
+                if (msg.cacheTtlMinutes != null) ttlField.inp.value = String(msg.cacheTtlMinutes);
+                if (msg.minMatchScore != null) scoreField.inp.value = String(msg.minMatchScore);
+                if (msg.requestTimeoutMs != null) timeoutField.inp.value = String(msg.requestTimeoutMs);
+                if (typeof msg.rejectUnauthorized === 'boolean') sslInput.checked = msg.rejectUnauthorized;
+            }
+
+            function setBusy(busy) {
+                saveBtn.disabled = !!busy;
+                refreshNowBtn.disabled = !!busy;
+                testBtn.disabled = !!busy;
+            }
+
+            closeBtn.onclick = function () { overlay.remove(); };
+            overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
+
+            refreshNowBtn.onclick = function () {
+                setBusy(true);
+                status.textContent = 'Загрузка пользователей из Битрикс24...';
+                sendPluginAction('refreshCache', {}, pendingSettings)
+                    .then(function (msg) {
+                        setBusy(false);
+                        applyState(msg);
+                        responseCache.clear();
+                        if (window.currentNode) loadContactsForNode(window.currentNode, true);
+                        status.textContent = msg.ok
+                            ? ('Кеш обновлён: ' + (msg.cacheSize || 0) + ' профилей.')
+                            : ('Ошибка: ' + (msg.error || 'не удалось обновить кеш'));
+                    })
+                    .catch(function (err) {
+                        setBusy(false);
+                        status.textContent = 'Ошибка: ' + err.message;
+                    });
+            };
+
+            testBtn.onclick = function () {
+                var q = testInput.value.trim();
+                if (!q) {
+                    testOut.textContent = 'Введите имя компьютера для проверки.';
+                    return;
+                }
+                setBusy(true);
+                testOut.textContent = 'Поиск...';
+                sendPluginAction('testMatch', { nodeName: q }, pendingSettings)
+                    .then(function (msg) {
+                        setBusy(false);
+                        applyState(msg);
+                        var res = msg.testResult;
+                        if (!res || res.ok === false) {
+                            testOut.textContent = (res && res.error) ? res.error : (msg.error || 'Ошибка проверки');
+                            return;
+                        }
+                        if (!res.matched || !res.profile) {
+                            testOut.textContent = 'Совпадение не найдено (лучший балл: ' + (res.score || 0) + ').';
+                            return;
+                        }
+                        var lines = ['Профиль: ' + res.profile.displayName + ' (балл: ' + res.score + ')'];
+                        if (Array.isArray(res.phones) && res.phones.length) {
+                            res.phones.forEach(function (p) { lines.push(p.label + ': ' + p.display); });
+                        } else {
+                            lines.push('Телефоны в профиле не заполнены.');
+                        }
+                        testOut.textContent = lines.join('\n');
+                    })
+                    .catch(function (err) {
+                        setBusy(false);
+                        testOut.textContent = 'Ошибка: ' + err.message;
+                    });
+            };
+
+            form.onsubmit = function (e) {
+                e.preventDefault();
+                setBusy(true);
+                status.textContent = 'Сохранение настроек и загрузка справочника...';
+                sendPluginAction('saveSettings', {
+                    settings: {
+                        webhookUrl: webhookInput.value.trim(),
+                        cacheTtlMinutes: Number(ttlField.inp.value),
+                        minMatchScore: Number(scoreField.inp.value),
+                        requestTimeoutMs: Number(timeoutField.inp.value),
+                        rejectUnauthorized: sslInput.checked
+                    }
+                }, pendingSettings)
+                    .then(function (msg) {
+                        setBusy(false);
+                        applyState(msg);
+                        webhookInput.value = '';
+                        responseCache.clear();
+                        if (window.currentNode) loadContactsForNode(window.currentNode, true);
+                        if (msg.saved && msg.ok) {
+                            status.textContent = 'Сохранено. Загружено профилей: ' + (msg.cacheSize || 0) + '.';
+                        } else if (msg.saved) {
+                            status.textContent = 'Настройки сохранены, но синхронизация завершилась с ошибкой: ' + (msg.error || '');
+                        } else {
+                            status.textContent = 'Ошибка: ' + (msg.error || 'не удалось сохранить');
+                        }
+                    })
+                    .catch(function (err) {
+                        setBusy(false);
+                        status.textContent = 'Ошибка: ' + err.message;
+                    });
+            };
+
+            setBusy(true);
+            sendPluginAction('getSettings', {}, pendingSettings)
+                .then(function (msg) {
+                    setBusy(false);
+                    applyState(msg);
+                    status.textContent = msg.ok ? 'Готово.' : ('Ошибка: ' + (msg.error || ''));
+                })
+                .catch(function (err) {
+                    setBusy(false);
+                    status.textContent = 'Ошибка загрузки настроек: ' + err.message;
+                });
+        }
+
+        function handleRefresh() {
+            try {
+                ensureAccountLink();
+                if (!window.currentNode || !window.currentNode._id) return;
+                loadContactsForNode(window.currentNode, false);
+            } catch (e) {}
+        }
+
+        function setupObservers() {
+            var summaryBtn = document.getElementById('MainDevGeneral') || document.getElementById('MainDevSummary');
+            if (summaryBtn && !summaryBtn._b24ContactsBound) {
+                summaryBtn._b24ContactsBound = true;
+                summaryBtn.addEventListener('click', function () {
+                    setTimeout(handleRefresh, 60);
+                });
+            }
+
+            var p10 = document.getElementById('p10');
+            if (p10 && typeof MutationObserver === 'function' && !p10._b24ContactsObserver) {
+                var scheduled = false;
+                var observer = new MutationObserver(function () {
+                    if (scheduled) return;
+                    scheduled = true;
+                    setTimeout(function () {
+                        scheduled = false;
+                        if (!window.currentNode || !isSummaryVisible()) return;
+                        var card = document.getElementById(CARD_ID);
+                        var activeName = typeof window.currentNode.name === 'string' ? window.currentNode.name : '';
+                        if (!card || card.dataset.nodeId !== (window.currentNode._id || '') || card.dataset.nodeName !== activeName) {
+                            handleRefresh();
+                        }
+                    }, 80);
+                });
+                observer.observe(p10, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+                p10._b24ContactsObserver = observer;
+            }
+        }
+
+        window.B24ContactsPlugin = {
+            inject: function () {
+                setupObservers();
+                handleRefresh();
+            },
+            onDeviceRefreshEnd: function () {
+                setupObservers();
+                handleRefresh();
+            },
+            onContactsResult: function (message) {
+                if (!message || typeof message !== 'object') return;
+                var reqId = message.requestId;
+                if (reqId && pendingContacts.has(reqId)) {
+                    var entry = pendingContacts.get(reqId);
+                    pendingContacts.delete(reqId);
+                    entry.resolve(message);
+                }
+            },
+            onSettingsResult: function (message) {
+                if (!message || typeof message !== 'object') return;
+                var reqId = message.requestId;
+                if (reqId && pendingSettings.has(reqId)) {
+                    var entry = pendingSettings.get(reqId);
+                    pendingSettings.delete(reqId);
+                    entry.resolve(message);
+                }
+            },
+            openSettings: openSettingsModal,
+            refresh: function () {
+                if (window.currentNode) {
+                    loadContactsForNode(window.currentNode, true);
+                }
+            }
+        };
+
+        window.B24ContactsPlugin.inject();
+        setInterval(function () {
+            if (window.B24ContactsPlugin) window.B24ContactsPlugin.inject();
+        }, 1500);
     };
 
     obj.onDeviceRefreshEnd = function () {
@@ -1042,6 +1985,19 @@ function createPlugin(parent) {
         var payload = (message && typeof message === 'object') ? message : server;
         if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.onContactsResult === 'function') {
             window.B24ContactsPlugin.onContactsResult(payload);
+        }
+    };
+
+    obj.onSettingsResult = function (server, message) {
+        var payload = (message && typeof message === 'object') ? message : server;
+        if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.onSettingsResult === 'function') {
+            window.B24ContactsPlugin.onSettingsResult(payload);
+        }
+    };
+
+    obj.openSettings = function () {
+        if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.openSettings === 'function') {
+            window.B24ContactsPlugin.openSettings();
         }
     };
 

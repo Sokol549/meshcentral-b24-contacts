@@ -31,15 +31,23 @@
        └── b24contacts/
            ├── b24contacts.js
            ├── config.json
-           ├── changelog.md
-           └── public/
-               └── b24contacts.js
+           └── changelog.md
    ```
    *(На Linux при необходимости выдайте права пользователю, от которого работает сервис MeshCentral: `chown -R meshcentral:meshcentral /opt/meshcentral/meshcentral-data/plugins/b24contacts`.)*
 
 ---
 
-## Настройка `config.json` MeshCentral
+## Настройка через Web-интерфейс MeshCentral (рекомендуется)
+
+1. Установите и включите плагин в **My Server → Plugins** по URL:
+   `https://raw.githubusercontent.com/Sokol549/meshcentral-b24-contacts/main/config.json`
+2. Обновите страницу браузера (`Ctrl+F5`).
+3. Перейдите в **Моя учетная запись → Действия учетной записи → Настройка Битрикс24 (Контакты)** (или нажмите кнопку **⚙ / Настроить подключение Битрикс24** прямо в карточке на вкладке «Сводка» любого компьютера).
+4. Вставьте URL входящего вебхука Битрикс24 (например `https://portal.bitrix24.ru/rest/1/ваш_токен/`), при необходимости настройте интервал обновления и нажмите **«Сохранить и синхронизировать»**. Настройки сохраняются на сервере в `meshcentral-data/b24contacts-settings.json` с правами доступа `0600` и применяются сразу без перезапуска MeshCentral.
+
+---
+
+## Настройка `config.json` MeshCentral (опционально)
 
 Откройте основной файл конфигурации `meshcentral-data/config.json` и добавьте в секцию `"settings"` блок `"plugins"` с включением плагинов, списком `"list"` (для ручной установки) и настройками `"b24contacts"`:
 
