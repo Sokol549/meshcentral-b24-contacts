@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0
+- Added manual device-to-Bitrix24 user binding in the plugin settings modal (`⚙`) and quick **«Привязать вручную»** button when automatic matching finds no profile.
+- Added searchable Bitrix24 user picker and management list of all manual bindings stored persistently in `b24contacts-settings.json` (`manualLinks`).
+- Added `ручная привязка` badge on manually linked Device Summary cards and preserved manual links across general settings updates.
+
 ## 1.3.1
 - Fixed HTTP 404 on `/plugin/b24contacts/oauth/callback` by promoting plugin HTTP routes right after `query`/`expressInit` (supports both Express 4 and Express 5 router stacks), registering `/*/plugin/b24contacts/oauth/callback`, registering on both `server.webserver.app` and `server.app`, and versioning the route registration flag (`ROUTES_VERSION`) so upgrades do not skip new routes.
 - Added Bitrix24 `server_domain` handling (e.g. `oauth.bitrix24.tech` / `oauth.bitrix.info`, strictly allowlisted) and `client_endpoint` persistence for OAuth token exchange and automatic token refresh.

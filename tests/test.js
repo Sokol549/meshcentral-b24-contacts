@@ -632,6 +632,27 @@ async function testFrontendInlineUi() {
     const muted = card.querySelector('.b24c-muted');
     assert.ok(muted);
     assert.equal(muted.textContent, 'Связанный профиль в Битрикс24 не найден');
+    const manualBtn = card.querySelector('.b24c-inline-btn');
+    assert.ok(manualBtn, 'Manual link button should appear when unmatched for admin');
+    assert.equal(manualBtn.textContent, 'Привязать вручную');
+
+    // Manual-linked device shows badge
+    windowObj.currentNode = { _id: 'node//4', name: 'Совсем другое имя ПК' };
+    sandbox.window.B24ContactsPlugin.onDeviceRefreshEnd();
+    const getContacts4 = sentMessages.filter((m) => m.pluginaction === 'getContacts')[3];
+    sandbox.window.B24ContactsPlugin.onContactsResult({
+        requestId: getContacts4.requestId,
+        ok: true,
+        matched: true,
+        manualLinked: true,
+        profile: { id: '202', displayName: 'Аптека №15 - Manual' },
+        phones: [{ type: 'work', label: 'Рабочий', display: '89990001122', href: 'tel:+79990001122' }],
+        chatAuth: { authenticated: false, oauthConfigured: false }
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    const badge = card.querySelector('.b24c-badge');
+    assert.ok(badge, 'Manual link badge should be rendered');
+    assert.equal(badge.textContent, 'ручная привязка');
 }
 
 async function testPerUserOAuthAndMiniChat() {
@@ -888,6 +909,130 @@ async function testOAuthServerDomainAndRoutePromotion() {
     }
 }
 
+async function testManualDeviceBinding() {
+    const mockUsers = [
+        {
+            ID: '10',
+            NAME: 'Аптека',
+            LAST_NAME: 'Краснодар Красная 5',
+            WORK_PHONE: '88612223344',
+            ACTIVE: true
+        },
+        {
+            ID: '20',
+            NAME: 'Склад',
+            LAST_NAME: 'Логистика',
+            PERSONAL_MOBILE: '89180009988',
+            ACTIVE: true
+        }
+    ];
+
+    const server = http.createServer((req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ result: mockUsers, total: mockUsers.length }));
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const tmpDatapath = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-b24-bind-'));
+
+    try {
+        const base = 'http://127.0.0.1:' + port;
+        const admin = { _id: 'user//admin', siteadmin: 0xFFFFFFFF };
+        const normalUser = { _id: 'user//op', siteadmin: 0 };
+        const plugin = pluginFactory(createMockParent({
+            settings: {
+                plugins: {
+                    enabled: true,
+                    b24contacts: {
+                        webhookUrl: base + '/rest/1/tok/'
+                    }
+                }
+            }
+        }, tmpDatapath));
+
+        await plugin._internal.refreshCache('test-init');
+
+        // Unmatched PC before manual link
+        const before = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'getContacts', requestId: 'b1', nodeId: 'node//custom1', nodeName: 'SRV-UNKNOWN-99' },
+                { user: normalUser, send: resolve }
+            );
+        });
+        assert.equal(before.ok, true);
+        assert.equal(before.matched, false);
+
+        // Non-admin cannot setManualLink
+        const forbidden = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'setManualLink', requestId: 'b2', nodeId: 'node//custom1', b24UserId: '20' },
+                { user: normalUser, send: resolve }
+            );
+        });
+        assert.equal(forbidden.ok, false);
+
+        // Admin links node//custom1 -> user 20
+        const linked = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'setManualLink', requestId: 'b3', nodeId: 'node//custom1', nodeName: 'SRV-UNKNOWN-99', b24UserId: '20' },
+                { user: admin, send: resolve }
+            );
+        });
+        assert.equal(linked.ok, true);
+        assert.equal(linked.linkSaved, true);
+        assert.equal(linked.manualLinks['node//custom1'].b24UserId, '20');
+        assert.equal(linked.manualLinks['node//custom1'].b24UserName, 'Логистика Склад');
+        assert.equal(linked.bitrixUsers.length, 2);
+
+        // Now getContacts resolves user 20 via manual link despite completely unrelated PC name
+        const after = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'getContacts', requestId: 'b4', nodeId: 'node//custom1', nodeName: 'SRV-UNKNOWN-99' },
+                { user: normalUser, send: resolve }
+            );
+        });
+        assert.equal(after.ok, true);
+        assert.equal(after.matched, true);
+        assert.equal(after.manualLinked, true);
+        assert.equal(after.profile.id, '20');
+        assert.equal(after.phones[0].href, 'tel:89180009988');
+
+        // General saveSettings MUST preserve manualLinks
+        const saved = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'saveSettings', requestId: 'b5', settings: { cacheTtlMinutes: 60 } },
+                { user: admin, send: resolve }
+            );
+        });
+        assert.equal(saved.saved, true);
+        assert.equal(saved.manualLinks['node//custom1'].b24UserId, '20');
+
+        // Clear manual link -> falls back to unmatched auto-match
+        const cleared = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'setManualLink', requestId: 'b6', nodeId: 'node//custom1', clearManualLink: true },
+                { user: admin, send: resolve }
+            );
+        });
+        assert.equal(cleared.ok, true);
+        assert.equal(cleared.cleared, true);
+        assert.equal(cleared.manualLinks['node//custom1'], undefined);
+
+        const afterClear = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'getContacts', requestId: 'b7', nodeId: 'node//custom1', nodeName: 'SRV-UNKNOWN-99' },
+                { user: normalUser, send: resolve }
+            );
+        });
+        assert.equal(afterClear.matched, false);
+        assert.equal(afterClear.manualLinked, false);
+    } finally {
+        fs.rmSync(tmpDatapath, { recursive: true, force: true });
+        await new Promise((resolve) => server.close(resolve));
+    }
+}
+
 async function main() {
     testManifest();
     testPrepExportsCompatibility();
@@ -897,6 +1042,7 @@ async function main() {
     await testFrontendInlineUi();
     await testPerUserOAuthAndMiniChat();
     await testOAuthServerDomainAndRoutePromotion();
+    await testManualDeviceBinding();
     console.log('All b24contacts tests passed!');
 }
 

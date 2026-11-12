@@ -177,6 +177,33 @@ function writeSavedSettings(server, nextSettings) {
     }
 }
 
+function normalizeManualLinks(raw) {
+    var out = {};
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+    var keys = Object.keys(raw);
+    for (var i = 0; i < keys.length; i++) {
+        var nodeId = String(keys[i] || '').trim();
+        if (!nodeId) continue;
+        var val = raw[keys[i]];
+        if (typeof val === 'string' || typeof val === 'number') {
+            var idOnly = String(val).trim();
+            if (idOnly) {
+                out[nodeId] = { b24UserId: idOnly, nodeName: '', updatedAt: 0 };
+            }
+        } else if (val && typeof val === 'object') {
+            var b24Id = val.b24UserId != null ? String(val.b24UserId).trim() : '';
+            if (b24Id) {
+                out[nodeId] = {
+                    b24UserId: b24Id,
+                    nodeName: typeof val.nodeName === 'string' ? val.nodeName.slice(0, 512) : '',
+                    updatedAt: Number(val.updatedAt) || 0
+                };
+            }
+        }
+    }
+    return out;
+}
+
 function loadSettings(server) {
     var fromMemory = server && server.config ? extractPluginConfigFromObject(server.config) : null;
     var fromDisk = (!fromMemory || !fromMemory.webhookUrl) && server && server.datapath
@@ -199,7 +226,8 @@ function loadSettings(server) {
         minMatchScore: clampNumber(merged.minMatchScore, DEFAULT_MIN_MATCH_SCORE, 0.2, 0.95),
         requestTimeoutMs: clampNumber(merged.requestTimeoutMs, DEFAULT_TIMEOUT_MS, 2000, 60000),
         pageDelayMs: clampNumber(merged.pageDelayMs, DEFAULT_PAGE_DELAY_MS, 0, 5000),
-        rejectUnauthorized: merged.rejectUnauthorized !== false
+        rejectUnauthorized: merged.rejectUnauthorized !== false,
+        manualLinks: normalizeManualLinks(merged.manualLinks)
     };
 }
 
@@ -927,7 +955,14 @@ function createPlugin(parent) {
         });
     }
 
-    async function lookupContacts(nodeName) {
+    function enrichProfileWithLinks(profile, settings) {
+        if (!profile || !profile.id) return profile;
+        var portalOrigin = extractPortalOrigin(settings.webhookUrl, settings.portalUrl);
+        var links = buildBitrixUserLinks(profile.id, portalOrigin);
+        return Object.assign({}, profile, links);
+    }
+
+    async function lookupContacts(nodeName, nodeId) {
         var settings = getSettings();
         if (!settings.webhookUrl) {
             return {
@@ -950,16 +985,52 @@ function createPlugin(parent) {
             };
         }
 
-        var match = findBestContactMatch(nodeName, cache.users, settings.minMatchScore);
-        var profile = match.profile;
-        if (profile && profile.id) {
-            var portalOrigin = extractPortalOrigin(settings.webhookUrl, settings.portalUrl);
-            var links = buildBitrixUserLinks(profile.id, portalOrigin);
-            profile = Object.assign({}, profile, links);
+        var safeNodeId = typeof nodeId === 'string' ? nodeId.trim() : '';
+        var manualEntry = (safeNodeId && settings.manualLinks && settings.manualLinks[safeNodeId])
+            ? settings.manualLinks[safeNodeId]
+            : null;
+        if (manualEntry && manualEntry.b24UserId) {
+            var manualProfile = null;
+            for (var i = 0; i < cache.users.length; i++) {
+                if (cache.users[i] && String(cache.users[i].id) === String(manualEntry.b24UserId)) {
+                    manualProfile = enrichProfileWithLinks(cache.users[i], settings);
+                    break;
+                }
+            }
+            if (manualProfile) {
+                return {
+                    ok: true,
+                    matched: true,
+                    manualLinked: true,
+                    manualB24UserId: String(manualEntry.b24UserId),
+                    score: 1,
+                    profile: manualProfile,
+                    phones: manualProfile.phones || [],
+                    cacheSize: cache.users.length,
+                    lastUpdated: cache.lastUpdated
+                };
+            }
+            return {
+                ok: true,
+                matched: false,
+                manualLinked: true,
+                missingManualUser: true,
+                manualB24UserId: String(manualEntry.b24UserId),
+                score: 0,
+                profile: null,
+                phones: [],
+                error: 'Привязанный вручную профиль Битрикс24 (ID ' + manualEntry.b24UserId + ') не найден среди активных пользователей',
+                cacheSize: cache.users.length,
+                lastUpdated: cache.lastUpdated
+            };
         }
+
+        var match = findBestContactMatch(nodeName, cache.users, settings.minMatchScore);
+        var profile = enrichProfileWithLinks(match.profile, settings);
         return {
             ok: true,
             matched: match.matched,
+            manualLinked: false,
             score: match.score,
             profile: profile,
             phones: profile ? profile.phones : [],
@@ -1295,9 +1366,51 @@ function createPlugin(parent) {
         };
     }
 
-    function getSettingsSummary(settings) {
+    function buildManualLinksSummary(manualLinks) {
+        var links = normalizeManualLinks(manualLinks);
+        var byId = new Map();
+        for (var i = 0; i < cache.users.length; i++) {
+            var u = cache.users[i];
+            if (u && u.id != null) byId.set(String(u.id), u);
+        }
+        var out = {};
+        var keys = Object.keys(links);
+        for (var j = 0; j < keys.length; j++) {
+            var nodeId = keys[j];
+            var entry = links[nodeId];
+            var user = byId.get(String(entry.b24UserId));
+            out[nodeId] = {
+                nodeId: nodeId,
+                nodeName: entry.nodeName || '',
+                b24UserId: String(entry.b24UserId),
+                b24UserName: user ? user.displayName : '',
+                activeInCache: Boolean(user),
+                updatedAt: entry.updatedAt || 0
+            };
+        }
+        return out;
+    }
+
+    function buildBitrixUsersSummary() {
+        var list = [];
+        for (var i = 0; i < cache.users.length; i++) {
+            var u = cache.users[i];
+            if (!u || !u.id) continue;
+            list.push({
+                id: String(u.id),
+                displayName: u.displayName || ('ID ' + u.id),
+                phones: Array.isArray(u.phones) ? u.phones.map(function (p) { return p.display; }).filter(Boolean) : []
+            });
+        }
+        list.sort(function (a, b) {
+            return a.displayName.localeCompare(b.displayName, 'ru');
+        });
+        return list;
+    }
+
+    function getSettingsSummary(settings, includeUsers) {
         var s = settings || getSettings();
-        return {
+        var summary = {
             hasWebhook: Boolean(s.webhookUrl),
             maskedWebhookUrl: maskWebhookUrl(s.webhookUrl),
             portalUrl: s.portalUrl,
@@ -1308,10 +1421,15 @@ function createPlugin(parent) {
             minMatchScore: s.minMatchScore,
             requestTimeoutMs: s.requestTimeoutMs,
             rejectUnauthorized: s.rejectUnauthorized,
+            manualLinks: buildManualLinksSummary(s.manualLinks),
             cacheSize: cache.users.length,
             lastUpdated: cache.lastUpdated,
             lastError: cache.lastError
         };
+        if (includeUsers) {
+            summary.bitrixUsers = buildBitrixUsersSummary();
+        }
+        return summary;
     }
 
     function rescheduleRefreshTimer(settings) {
@@ -1331,7 +1449,7 @@ function createPlugin(parent) {
         }
     }
 
-    var ROUTES_VERSION = '1.3.1';
+    var ROUTES_VERSION = '1.4.0';
 
     function getExpressApps() {
         var server = getServer();
@@ -1390,12 +1508,13 @@ function createPlugin(parent) {
                     return res.status(401).json({ ok: false, error: 'Unauthorized' });
                 }
 
+                var nodeId = typeof req.query.nodeId === 'string' ? req.query.nodeId.slice(0, 128) : '';
                 var nodeName = typeof req.query.nodeName === 'string' ? req.query.nodeName.slice(0, 512) : '';
-                if (!nodeName.trim()) {
+                if (!nodeName.trim() && !nodeId.trim()) {
                     return res.status(400).json({ ok: false, error: 'Missing nodeName parameter' });
                 }
 
-                var result = await lookupContacts(nodeName);
+                var result = await lookupContacts(nodeName, nodeId);
                 res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
                 return res.status(200).json(result);
             } catch (err) {
@@ -1588,7 +1707,7 @@ function createPlugin(parent) {
                         return;
                     }
 
-                    var result = await lookupContacts(nodeName);
+                    var result = await lookupContacts(nodeName, nodeId);
                     result.chatAuth = getUserChatAuthStatus(client.user._id);
                     sendToClient(client, Object.assign({
                         action: 'plugin',
@@ -1628,13 +1747,19 @@ function createPlugin(parent) {
                 });
                 return;
             }
-            sendToClient(client, Object.assign({
-                action: 'plugin',
-                plugin: PLUGIN_NAME,
-                method: 'onSettingsResult',
-                requestId: requestId,
-                ok: true
-            }, getSettingsSummary()));
+            (async function () {
+                var settings = getSettings();
+                if (settings.webhookUrl && cache.users.length === 0) {
+                    try { await ensureCacheReady(); } catch (e) {}
+                }
+                sendToClient(client, Object.assign({
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onSettingsResult',
+                    requestId: requestId,
+                    ok: true
+                }, getSettingsSummary(settings, true)));
+            })();
             return;
         }
 
@@ -1676,7 +1801,8 @@ function createPlugin(parent) {
                         minMatchScore: clampNumber(incoming.minMatchScore, current.minMatchScore, 0.2, 0.95),
                         requestTimeoutMs: clampNumber(incoming.requestTimeoutMs, current.requestTimeoutMs, 2000, 60000),
                         pageDelayMs: current.pageDelayMs,
-                        rejectUnauthorized: incoming.rejectUnauthorized !== false
+                        rejectUnauthorized: incoming.rejectUnauthorized !== false,
+                        manualLinks: current.manualLinks || {}
                     };
                     writeSavedSettings(getServer(), nextSettings);
                     rescheduleRefreshTimer(nextSettings);
@@ -1698,7 +1824,7 @@ function createPlugin(parent) {
                         saved: true,
                         ok: nextSettings.webhookUrl ? ok : true,
                         error: nextSettings.webhookUrl && !ok ? cache.lastError : null
-                    }, getSettingsSummary(nextSettings)));
+                    }, getSettingsSummary(nextSettings, true)));
                 } catch (err) {
                     sendToClient(client, {
                         action: 'plugin',
@@ -1708,6 +1834,95 @@ function createPlugin(parent) {
                         saved: false,
                         ok: false,
                         error: err && err.message ? err.message : 'Не удалось сохранить настройки'
+                    });
+                }
+            })();
+            return;
+        }
+
+        if (action === 'setManualLink') {
+            if (!isUserAdmin(client.user)) {
+                sendToClient(client, {
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onSettingsResult',
+                    requestId: requestId,
+                    ok: false,
+                    error: 'Требуются права администратора MeshCentral'
+                });
+                return;
+            }
+            (async function () {
+                try {
+                    var targetNodeId = typeof command.nodeId === 'string' ? command.nodeId.trim().slice(0, 128) : '';
+                    var targetNodeName = typeof command.nodeName === 'string' ? command.nodeName.trim().slice(0, 512) : '';
+                    var b24UserId = (command.clearManualLink === true || command.b24UserId == null)
+                        ? ''
+                        : String(command.b24UserId).trim().slice(0, 64);
+
+                    if (!targetNodeId) {
+                        throw new Error('Не указан идентификатор компьютера (nodeId)');
+                    }
+
+                    var current = getSettings();
+                    var nextLinks = Object.assign({}, current.manualLinks || {});
+
+                    if (!b24UserId) {
+                        delete nextLinks[targetNodeId];
+                    } else {
+                        if (current.webhookUrl && cache.users.length === 0) {
+                            await ensureCacheReady();
+                        }
+                        var foundUser = null;
+                        for (var i = 0; i < cache.users.length; i++) {
+                            if (cache.users[i] && String(cache.users[i].id) === b24UserId) {
+                                foundUser = cache.users[i];
+                                break;
+                            }
+                        }
+                        if (cache.users.length > 0 && !foundUser) {
+                            throw new Error('Пользователь Битрикс24 с ID ' + b24UserId + ' не найден в списке активных сотрудников');
+                        }
+                        nextLinks[targetNodeId] = {
+                            b24UserId: b24UserId,
+                            nodeName: targetNodeName || (nextLinks[targetNodeId] && nextLinks[targetNodeId].nodeName) || '',
+                            updatedAt: Date.now()
+                        };
+                    }
+
+                    var nextSettings = {
+                        webhookUrl: current.webhookUrl,
+                        portalUrl: current.portalUrl,
+                        oauthClientId: current.oauthClientId,
+                        oauthClientSecret: current.oauthClientSecret,
+                        cacheTtlMinutes: current.cacheTtlMinutes,
+                        minMatchScore: current.minMatchScore,
+                        requestTimeoutMs: current.requestTimeoutMs,
+                        pageDelayMs: current.pageDelayMs,
+                        rejectUnauthorized: current.rejectUnauthorized,
+                        manualLinks: nextLinks
+                    };
+                    writeSavedSettings(getServer(), nextSettings);
+
+                    sendToClient(client, Object.assign({
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onSettingsResult',
+                        requestId: requestId,
+                        linkSaved: true,
+                        linkedNodeId: targetNodeId,
+                        cleared: !b24UserId,
+                        ok: true
+                    }, getSettingsSummary(nextSettings, true)));
+                } catch (err) {
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onSettingsResult',
+                        requestId: requestId,
+                        linkSaved: false,
+                        ok: false,
+                        error: err && err.message ? err.message : 'Не удалось сохранить привязку'
                     });
                 }
             })();
@@ -1769,7 +1984,7 @@ function createPlugin(parent) {
                     refreshed: true,
                     ok: ok,
                     error: ok ? null : cache.lastError
-                }, getSettingsSummary());
+                }, getSettingsSummary(undefined, true));
                 sendToClient(client, payload);
             }).catch(function (err) {
                 sendToClient(client, {
@@ -2083,11 +2298,15 @@ function createPlugin(parent) {
                 '#' + CARD_ID + ' .b24c-chat-alt{display:flex;flex-direction:column;gap:6px;margin-top:4px}',
                 '#' + CARD_ID + ' .b24c-muted{color:#6b7280;font-size:12px}',
                 '#' + CARD_ID + ' .b24c-error{color:#b91c1c;font-size:12px}',
+                '#' + CARD_ID + ' .b24c-empty-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
+                '#' + CARD_ID + ' .b24c-badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:10px;background:#e0f2fe;color:#0369a1;font-size:10px;font-weight:600;vertical-align:middle}',
                 '#' + CARD_ID + ' .b24c-inline-btn{margin-top:4px;background:#1769f5;color:#fff;border:1px solid #1769f5;border-radius:4px;padding:5px 10px;font-size:12px;cursor:pointer;align-self:flex-start}',
+                '#' + CARD_ID + ' .b24c-inline-btn.secondary{margin-top:0;background:#fff;color:#1d4ed8;border-color:#cbd5e1;padding:3px 9px}',
+                '#' + CARD_ID + ' .b24c-inline-btn.secondary:hover{background:#eff6ff;border-color:#93c5fd}',
                 '#' + CARD_ID + ' .b24c-inline-btn:hover{background:#0758d8}',
                 '@media(max-width:720px){#' + CARD_ID + ' .b24c-grid{grid-template-columns:1fr}}',
                 '#' + MODAL_ID + '{position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(14,25,43,.58);box-sizing:border-box}',
-                '#' + MODAL_ID + ' form{box-sizing:border-box;width:min(620px,100%);max-height:calc(100vh - 36px);overflow:auto;background:#fff;color:#202a35;border-radius:7px;box-shadow:0 16px 48px #0005;font:14px Arial,sans-serif}',
+                '#' + MODAL_ID + ' form{box-sizing:border-box;width:min(640px,100%);max-height:calc(100vh - 36px);overflow:auto;background:#fff;color:#202a35;border-radius:7px;box-shadow:0 16px 48px #0005;font:14px Arial,sans-serif}',
                 '#' + MODAL_ID + ' *{box-sizing:border-box}',
                 '#' + MODAL_ID + ' .b24c-m-header{padding:16px 22px 12px;border-bottom:1px solid #dfe5ed}',
                 '#' + MODAL_ID + ' .b24c-m-header h2{margin:0;font-size:19px}',
@@ -2096,8 +2315,15 @@ function createPlugin(parent) {
                 '#' + MODAL_ID + ' .b24c-m-card{padding:12px 14px;border:1px solid #dfe5ed;border-radius:5px;background:#f8fafc}',
                 '#' + MODAL_ID + ' label{display:block;color:#334155;font-size:12px;font-weight:600;margin-bottom:8px}',
                 '#' + MODAL_ID + ' label:last-child{margin-bottom:0}',
-                '#' + MODAL_ID + ' input:not([type=checkbox]){display:block;width:100%;height:31px;margin:4px 0 0;padding:5px 8px;border:1px solid #b9c4d2;border-radius:3px;background:#fff;color:#202a35;font:13px Arial,sans-serif}',
-                '#' + MODAL_ID + ' input:focus{outline:2px solid #90bcff;border-color:#1769f5}',
+                '#' + MODAL_ID + ' input:not([type=checkbox]),#' + MODAL_ID + ' select{display:block;width:100%;margin:4px 0 0;padding:5px 8px;border:1px solid #b9c4d2;border-radius:3px;background:#fff;color:#202a35;font:13px Arial,sans-serif}',
+                '#' + MODAL_ID + ' input:not([type=checkbox]){height:31px}',
+                '#' + MODAL_ID + ' select.b24c-m-select{height:auto;min-height:118px;padding:4px}',
+                '#' + MODAL_ID + ' input:focus,#' + MODAL_ID + ' select:focus{outline:2px solid #90bcff;border-color:#1769f5}',
+                '#' + MODAL_ID + ' .b24c-m-btn-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}',
+                '#' + MODAL_ID + ' .b24c-m-links-list{margin-top:10px;border-top:1px solid #e2e8f0;padding-top:8px;display:flex;flex-direction:column;gap:5px;max-height:130px;overflow-y:auto}',
+                '#' + MODAL_ID + ' .b24c-m-link-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 6px;background:#fff;border:1px solid #e2e8f0;border-radius:3px;font-size:12px}',
+                '#' + MODAL_ID + ' .b24c-m-link-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1e293b}',
+                '#' + MODAL_ID + ' .b24c-m-btn-sm{padding:2px 7px !important;font-size:11px !important;flex-shrink:0}',
                 '#' + MODAL_ID + ' .b24c-m-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}',
                 '#' + MODAL_ID + ' .b24c-m-check{display:flex;align-items:center;gap:6px;font-weight:400;margin-top:8px}',
                 '#' + MODAL_ID + ' .b24c-m-note{margin:4px 0 8px;color:#5c6a7a;font-size:12px;word-break:break-all}',
@@ -2710,10 +2936,25 @@ function createPlugin(parent) {
 
             if (!data.matched || !data.profile) {
                 if (chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
+                var emptyRow = document.createElement('div');
+                emptyRow.className = 'b24c-empty-row';
                 var emptyEl = document.createElement('div');
-                emptyEl.className = 'b24c-muted';
-                emptyEl.textContent = 'Связанный профиль в Битрикс24 не найден';
-                body.appendChild(emptyEl);
+                emptyEl.className = data.missingManualUser ? 'b24c-error' : 'b24c-muted';
+                emptyEl.textContent = (data.missingManualUser && data.error)
+                    ? data.error
+                    : 'Связанный профиль в Битрикс24 не найден';
+                emptyRow.appendChild(emptyEl);
+
+                if (isCurrentUserAdmin() && node && node._id) {
+                    var manualBtn = document.createElement('button');
+                    manualBtn.type = 'button';
+                    manualBtn.className = 'b24c-inline-btn secondary';
+                    manualBtn.textContent = data.missingManualUser ? 'Изменить привязку' : 'Привязать вручную';
+                    manualBtn.onclick = function () { openSettingsModal({ focusLinkSearch: true }); };
+                    emptyRow.appendChild(manualBtn);
+                }
+
+                body.appendChild(emptyRow);
                 return;
             }
 
@@ -2728,6 +2969,12 @@ function createPlugin(parent) {
                 var profEl = document.createElement('div');
                 profEl.className = 'b24c-profile';
                 profEl.textContent = data.profile.displayName;
+                if (data.manualLinked) {
+                    var badge = document.createElement('span');
+                    badge.className = 'b24c-badge';
+                    badge.textContent = 'ручная привязка';
+                    profEl.appendChild(badge);
+                }
                 infoCol.appendChild(profEl);
             }
 
@@ -2880,9 +3127,16 @@ function createPlugin(parent) {
             return line;
         }
 
-        function openSettingsModal() {
+        function openSettingsModal(opts) {
             injectStyles();
             if (document.getElementById(MODAL_ID)) return;
+
+            var activeNode = (window.currentNode && window.currentNode._id)
+                ? { _id: String(window.currentNode._id), name: String(window.currentNode.name || '') }
+                : null;
+            var cachedUsersList = [];
+            var currentManualLinks = {};
+            var manualDeleteButtons = [];
 
             var overlay = document.createElement('div');
             overlay.id = MODAL_ID;
@@ -2906,6 +3160,68 @@ function createPlugin(parent) {
 
             var body = document.createElement('div');
             body.className = 'b24c-m-body';
+
+            var manualCard = document.createElement('section');
+            manualCard.className = 'b24c-m-card';
+            var manualTitle = document.createElement('label');
+            manualTitle.textContent = activeNode
+                ? 'Ручная привязка этого компьютера к пользователю Битрикс24'
+                : 'Ручные привязки компьютеров к Битрикс24';
+            manualCard.appendChild(manualTitle);
+
+            var manualCurrentNote = null;
+            var linkSearchInput = null;
+            var linkSelect = null;
+            var bindBtn = null;
+            var unbindBtn = null;
+
+            if (activeNode) {
+                manualCurrentNote = document.createElement('p');
+                manualCurrentNote.className = 'b24c-m-note';
+                manualCurrentNote.textContent = 'ПК: ' + (activeNode.name || activeNode._id) + ' — автоподбор по имени';
+                manualCard.appendChild(manualCurrentNote);
+
+                var searchLabel = document.createElement('label');
+                searchLabel.textContent = 'Поиск пользователя Битрикс24';
+                linkSearchInput = document.createElement('input');
+                linkSearchInput.type = 'text';
+                linkSearchInput.placeholder = 'Адрес, ФИО, телефон или ID...';
+                linkSearchInput.autocomplete = 'off';
+                linkSearchInput.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') e.preventDefault();
+                });
+                searchLabel.appendChild(linkSearchInput);
+                manualCard.appendChild(searchLabel);
+
+                linkSelect = document.createElement('select');
+                linkSelect.className = 'b24c-m-select';
+                linkSelect.size = 6;
+                manualCard.appendChild(linkSelect);
+
+                var btnRow = document.createElement('div');
+                btnRow.className = 'b24c-m-btn-row';
+                bindBtn = document.createElement('button');
+                bindBtn.type = 'button';
+                bindBtn.className = 'b24c-m-primary';
+                bindBtn.textContent = 'Привязать к этому ПК';
+                unbindBtn = document.createElement('button');
+                unbindBtn.type = 'button';
+                unbindBtn.textContent = 'Сбросить (автоподбор)';
+                unbindBtn.disabled = true;
+                btnRow.appendChild(bindBtn);
+                btnRow.appendChild(unbindBtn);
+                manualCard.appendChild(btnRow);
+            } else {
+                var openFromPcNote = document.createElement('p');
+                openFromPcNote.className = 'b24c-m-note';
+                openFromPcNote.textContent = 'Чтобы привязать конкретный компьютер, откройте его вкладку «Сводка» и нажмите ⚙ или «Привязать вручную».';
+                manualCard.appendChild(openFromPcNote);
+            }
+
+            var manualListWrap = document.createElement('div');
+            manualListWrap.className = 'b24c-m-links-list';
+            manualListWrap.style.display = 'none';
+            manualCard.appendChild(manualListWrap);
 
             var connCard = document.createElement('section');
             connCard.className = 'b24c-m-card';
@@ -3023,9 +3339,17 @@ function createPlugin(parent) {
             oauthCard.appendChild(clientSecretLabel);
             oauthCard.appendChild(oauthNote);
 
-            body.appendChild(connCard);
-            body.appendChild(oauthCard);
-            body.appendChild(testCard);
+            if (activeNode) {
+                body.appendChild(manualCard);
+                body.appendChild(connCard);
+                body.appendChild(oauthCard);
+                body.appendChild(testCard);
+            } else {
+                body.appendChild(connCard);
+                body.appendChild(oauthCard);
+                body.appendChild(testCard);
+                body.appendChild(manualCard);
+            }
 
             var footer = document.createElement('div');
             footer.className = 'b24c-m-footer';
@@ -3058,6 +3382,120 @@ function createPlugin(parent) {
             overlay.appendChild(form);
             document.body.appendChild(overlay);
 
+            function renderUsersSelect() {
+                if (!linkSelect) return;
+                var prevVal = linkSelect.value;
+                var linkedId = (activeNode && currentManualLinks[activeNode._id])
+                    ? String(currentManualLinks[activeNode._id].b24UserId || '')
+                    : '';
+                var q = linkSearchInput ? linkSearchInput.value.trim().toLowerCase().replace(/ё/g, 'е') : '';
+                linkSelect.replaceChildren();
+
+                var filtered = [];
+                for (var i = 0; i < cachedUsersList.length; i++) {
+                    var u = cachedUsersList[i];
+                    if (!u || !u.id) continue;
+                    var phonesStr = Array.isArray(u.phones) && u.phones.length ? u.phones.join(', ') : '';
+                    if (q) {
+                        var hay = (u.displayName + ' ' + phonesStr + ' ' + u.id).toLowerCase().replace(/ё/g, 'е');
+                        if (hay.indexOf(q) === -1) continue;
+                    }
+                    filtered.push(u);
+                }
+
+                if (filtered.length === 0) {
+                    var emptyOpt = document.createElement('option');
+                    emptyOpt.disabled = true;
+                    emptyOpt.textContent = cachedUsersList.length === 0
+                        ? 'Справочник пуст — сначала сохраните вебхук или обновите кеш'
+                        : 'По запросу «' + q + '» пользователи не найдены';
+                    linkSelect.appendChild(emptyOpt);
+                    return;
+                }
+
+                var targetSelect = prevVal || linkedId;
+                for (var j = 0; j < filtered.length; j++) {
+                    var item = filtered[j];
+                    var opt = document.createElement('option');
+                    opt.value = String(item.id);
+                    var phonesLabel = Array.isArray(item.phones) && item.phones.length
+                        ? (' — ' + item.phones.join(', '))
+                        : '';
+                    opt.textContent = item.displayName + phonesLabel + ' (ID ' + item.id + ')';
+                    if (targetSelect && opt.value === targetSelect) {
+                        opt.selected = true;
+                    }
+                    linkSelect.appendChild(opt);
+                }
+            }
+
+            function saveManualLinkChange(nodeIdToSave, nodeNameToSave, b24UserIdToSave, clearFlag) {
+                setBusy(true);
+                status.textContent = clearFlag ? 'Сброс ручной привязки...' : 'Сохранение ручной привязки...';
+                sendPluginAction('setManualLink', {
+                    nodeId: nodeIdToSave,
+                    nodeName: nodeNameToSave || '',
+                    b24UserId: clearFlag ? '' : String(b24UserIdToSave || ''),
+                    clearManualLink: Boolean(clearFlag)
+                }, pendingSettings)
+                    .then(function (msg) {
+                        setBusy(false);
+                        if (!msg || !msg.ok) {
+                            status.textContent = 'Ошибка: ' + ((msg && msg.error) || 'не удалось сохранить привязку');
+                            return;
+                        }
+                        applyState(msg);
+                        configRevision++;
+                        responseCache.clear();
+                        if (window.currentNode) loadContactsForNode(window.currentNode, true);
+                        status.textContent = clearFlag ? 'Ручная привязка сброшена (включён автоподбор).' : 'Ручная привязка сохранена.';
+                    })
+                    .catch(function (err) {
+                        setBusy(false);
+                        status.textContent = 'Ошибка: ' + err.message;
+                    });
+            }
+
+            function renderManualLinksList() {
+                manualListWrap.replaceChildren();
+                manualDeleteButtons = [];
+                var keys = Object.keys(currentManualLinks || {});
+                if (keys.length === 0) {
+                    manualListWrap.style.display = 'none';
+                    return;
+                }
+                manualListWrap.style.display = 'flex';
+                var head = document.createElement('div');
+                head.className = 'b24c-m-note';
+                head.style.margin = '0 0 2px';
+                head.textContent = 'Все ручные привязки (' + keys.length + '):';
+                manualListWrap.appendChild(head);
+
+                keys.forEach(function (nId) {
+                    var info = currentManualLinks[nId];
+                    if (!info) return;
+                    var row = document.createElement('div');
+                    row.className = 'b24c-m-link-item';
+                    var text = document.createElement('span');
+                    text.className = 'b24c-m-link-text';
+                    var pcLabel = info.nodeName || nId;
+                    var b24Label = info.b24UserName ? (info.b24UserName + ' (ID ' + info.b24UserId + ')') : ('ID ' + info.b24UserId);
+                    text.textContent = pcLabel + ' → ' + b24Label;
+                    text.title = pcLabel + ' (' + nId + ') → ' + b24Label;
+                    var delBtn = document.createElement('button');
+                    delBtn.type = 'button';
+                    delBtn.className = 'b24c-m-btn-sm';
+                    delBtn.textContent = 'Удалить';
+                    delBtn.onclick = function () {
+                        saveManualLinkChange(nId, info.nodeName || '', '', true);
+                    };
+                    manualDeleteButtons.push(delBtn);
+                    row.appendChild(text);
+                    row.appendChild(delBtn);
+                    manualListWrap.appendChild(row);
+                });
+            }
+
             function applyState(msg) {
                 if (!msg) return;
                 sub.textContent = formatStatusLine(msg);
@@ -3072,16 +3510,69 @@ function createPlugin(parent) {
                 if (msg.minMatchScore != null) scoreField.inp.value = String(msg.minMatchScore);
                 if (msg.requestTimeoutMs != null) timeoutField.inp.value = String(msg.requestTimeoutMs);
                 if (typeof msg.rejectUnauthorized === 'boolean') sslInput.checked = msg.rejectUnauthorized;
+                if (Array.isArray(msg.bitrixUsers)) cachedUsersList = msg.bitrixUsers;
+                if (msg.manualLinks && typeof msg.manualLinks === 'object') currentManualLinks = msg.manualLinks;
+
+                if (activeNode && manualCurrentNote) {
+                    var linkInfo = currentManualLinks[activeNode._id];
+                    if (linkInfo && linkInfo.b24UserId) {
+                        var userLabel = linkInfo.b24UserName
+                            ? (linkInfo.b24UserName + ' (ID ' + linkInfo.b24UserId + ')')
+                            : ('ID ' + linkInfo.b24UserId);
+                        manualCurrentNote.textContent = 'ПК: ' + (activeNode.name || activeNode._id) + ' — привязан вручную: ' + userLabel;
+                        if (unbindBtn) unbindBtn.disabled = false;
+                    } else {
+                        manualCurrentNote.textContent = 'ПК: ' + (activeNode.name || activeNode._id) + ' — автоподбор по имени';
+                        if (unbindBtn) unbindBtn.disabled = true;
+                    }
+                    renderUsersSelect();
+                }
+                renderManualLinksList();
             }
 
             function setBusy(busy) {
                 saveBtn.disabled = !!busy;
                 refreshNowBtn.disabled = !!busy;
                 testBtn.disabled = !!busy;
+                if (bindBtn) bindBtn.disabled = !!busy;
+                if (unbindBtn) {
+                    var hasCurrentLink = Boolean(activeNode && currentManualLinks && currentManualLinks[activeNode._id]);
+                    unbindBtn.disabled = !!busy || !hasCurrentLink;
+                }
+                for (var b = 0; b < manualDeleteButtons.length; b++) {
+                    manualDeleteButtons[b].disabled = !!busy;
+                }
+            }
+
+            if (linkSearchInput) {
+                linkSearchInput.oninput = function () { renderUsersSelect(); };
+            }
+            if (linkSelect) {
+                linkSelect.ondblclick = function () {
+                    if (bindBtn && !bindBtn.disabled) bindBtn.click();
+                };
+            }
+            if (bindBtn && activeNode && linkSelect) {
+                bindBtn.onclick = function () {
+                    var chosenId = linkSelect.value;
+                    if (!chosenId) {
+                        status.textContent = 'Выберите пользователя Битрикс24 из списка.';
+                        return;
+                    }
+                    saveManualLinkChange(activeNode._id, activeNode.name, chosenId, false);
+                };
+            }
+            if (unbindBtn && activeNode) {
+                unbindBtn.onclick = function () {
+                    saveManualLinkChange(activeNode._id, activeNode.name, '', true);
+                };
             }
 
             closeBtn.onclick = function () { overlay.remove(); };
             overlay.onclick = function (e) { if (e.target === overlay) overlay.remove(); };
+            if (opts && opts.focusLinkSearch && linkSearchInput) {
+                setTimeout(function () { try { linkSearchInput.focus(); } catch (e) {} }, 30);
+            }
 
             refreshNowBtn.onclick = function () {
                 setBusy(true);
