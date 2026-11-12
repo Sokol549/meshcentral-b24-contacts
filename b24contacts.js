@@ -69,7 +69,11 @@ function buildUserGetUrl(webhookUrl) {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
         throw new Error('Неподдерживаемый протокол webhookUrl: ' + parsed.protocol);
     }
-    if (!/\/user\.get(\.json)?$/i.test(parsed.pathname)) {
+    // Strip any sample method suffix (e.g. "/profile.json") from Bitrix24 request generator URLs
+    var restBase = /^(.*\/rest\/\d+\/[^/]+)(?:\/.*)?$/i.exec(parsed.pathname);
+    if (restBase) {
+        parsed.pathname = restBase[1] + '/user.get.json';
+    } else if (!/\/user\.get(\.json)?$/i.test(parsed.pathname)) {
         parsed.pathname = parsed.pathname.replace(/\/+$/, '') + '/user.get.json';
     }
     return parsed.toString();

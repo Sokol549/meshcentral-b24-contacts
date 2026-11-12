@@ -116,6 +116,15 @@ function makeDomShim() {
 function testManifest() {
     assert.equal(manifest.shortName, 'b24contacts');
     assert.match(manifest.shortName, /^[a-zA-Z0-9]+$/);
+    const plugin = pluginFactory(createMockParent());
+    assert.equal(
+        plugin._internal.buildUserGetUrl('https://bitrix.kzvs.org/rest/23828/tok123/profile.json'),
+        'https://bitrix.kzvs.org/rest/23828/tok123/user.get.json'
+    );
+    assert.equal(
+        plugin._internal.buildUserGetUrl('https://bitrix.kzvs.org/rest/23828/tok123/'),
+        'https://bitrix.kzvs.org/rest/23828/tok123/user.get.json'
+    );
     assert.equal(typeof manifest.name, 'string');
     assert.equal(typeof manifest.version, 'string');
     assert.equal(typeof manifest.description, 'string');
