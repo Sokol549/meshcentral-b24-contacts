@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.1
+- Fixed HTTP 404 on `/plugin/b24contacts/oauth/callback` by promoting plugin HTTP routes right after `query`/`expressInit` (supports both Express 4 and Express 5 router stacks), registering `/*/plugin/b24contacts/oauth/callback`, registering on both `server.webserver.app` and `server.app`, and versioning the route registration flag (`ROUTES_VERSION`) so upgrades do not skip new routes.
+- Added Bitrix24 `server_domain` handling (e.g. `oauth.bitrix24.tech` / `oauth.bitrix.info`, strictly allowlisted) and `client_endpoint` persistence for OAuth token exchange and automatic token refresh.
+
 ## 1.3.0
 - Added embedded 4-message Bitrix24 mini-chat right next to the pharmacy phones on the Device Summary card.
 - Added per-user Bitrix24 authentication (each MeshCentral user logs in with their own Bitrix24 account via OAuth 2.0 Local Application or personal webhook, stored encrypted per user with AES-256-GCM).

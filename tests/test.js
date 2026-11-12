@@ -775,6 +775,119 @@ async function testPerUserOAuthAndMiniChat() {
     }
 }
 
+async function testOAuthServerDomainAndRoutePromotion() {
+    const tmpDatapath = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-b24-routes-'));
+    try {
+        const plugin = pluginFactory(createMockParent({
+            settings: {
+                plugins: {
+                    enabled: true,
+                    b24contacts: {
+                        portalUrl: 'https://bitrix.kzvs.org',
+                        oauthClientId: 'local.app.1',
+                        oauthClientSecret: 'sec_123'
+                    }
+                }
+            }
+        }, tmpDatapath));
+
+        // 1. Validate Bitrix OAuth server_domain allowlist (cloud OAuth vs portal host vs evil host)
+        assert.equal(
+            plugin._internal.resolveOAuthTokenOrigin('oauth.bitrix24.tech', 'https://bitrix.kzvs.org'),
+            'https://oauth.bitrix24.tech'
+        );
+        assert.equal(
+            plugin._internal.resolveOAuthTokenOrigin('oauth.bitrix.info', 'https://bitrix.kzvs.org'),
+            'https://oauth.bitrix.info'
+        );
+        assert.equal(
+            plugin._internal.resolveOAuthTokenOrigin('bitrix.kzvs.org', 'https://bitrix.kzvs.org'),
+            'https://bitrix.kzvs.org'
+        );
+        assert.equal(
+            plugin._internal.resolveOAuthTokenOrigin('', 'https://bitrix.kzvs.org'),
+            'https://bitrix.kzvs.org'
+        );
+        assert.throws(
+            () => plugin._internal.resolveOAuthTokenOrigin('evil.example.com', 'https://bitrix.kzvs.org'),
+            /Недопустимый OAuth-сервер/
+        );
+        await assert.rejects(
+            () => plugin._internal.completeOAuthCallback('code_x', (() => {
+                plugin._internal.oauthStates.set('st_evil', {
+                    userId: 'user//u1',
+                    redirectUri: 'https://mc.kzvs.pro/plugin/b24contacts/oauth/callback',
+                    createdAt: Date.now()
+                });
+                return 'st_evil';
+            })(), 'evil.example.com'),
+            /Недопустимый OAuth-сервер/
+        );
+        assert.equal(
+            plugin._internal.resolveRestEndpoint('https://bitrix.kzvs.org/rest/', 'https://bitrix.kzvs.org'),
+            'https://bitrix.kzvs.org/rest'
+        );
+
+        // 2. Express 4 mock app (with legacy _b24ContactsRoutesRegistered=true from older version & query/expressInit at 0..1)
+        const createMockExpress = (initialStack, useExpress5Router) => {
+            const routes = {};
+            const routerObj = { stack: initialStack.slice() };
+            const app = {
+                _b24ContactsRoutesRegistered: true, // simulate stale flag from v1.2.0
+                routes,
+                get(routePath, handler) {
+                    routes[routePath] = handler;
+                    routerObj.stack.push({ route: { path: routePath }, handle: handler });
+                }
+            };
+            if (useExpress5Router) {
+                app.router = routerObj;
+            } else {
+                app._router = routerObj;
+            }
+            return app;
+        };
+
+        const express4App = createMockExpress([
+            { name: 'query' },
+            { name: 'expressInit' },
+            { route: { path: '/plugin/b24contacts/api/contacts' } }, // stale v1.2.0 layer
+            { name: 'catchAll404' }
+        ], false);
+        assert.equal(plugin._internal.registerRoutes(express4App), true);
+        const e4Paths = express4App._router.stack.map((l) => (l.route ? l.route.path : l.name));
+        assert.deepEqual(e4Paths, [
+            'query',
+            'expressInit',
+            '/plugin/b24contacts/api/contacts',
+            '/plugin/b24contacts/oauth/callback',
+            '/*/plugin/b24contacts/oauth/callback',
+            'catchAll404'
+        ]);
+
+        // 3. Express 5 mock app (no query/expressInit middleware at indices 0..1; app.router instead of app._router)
+        const express5App = createMockExpress([
+            { name: 'domainHandler' },
+            { name: 'catchAll404' }
+        ], true);
+        assert.equal(plugin._internal.registerRoutes(express5App), true);
+        const e5Paths = express5App.router.stack.map((l) => (l.route ? l.route.path : l.name));
+        assert.deepEqual(e5Paths, [
+            '/plugin/b24contacts/api/contacts',
+            '/plugin/b24contacts/oauth/callback',
+            '/*/plugin/b24contacts/oauth/callback',
+            'domainHandler',
+            'catchAll404'
+        ]);
+
+        // Re-running registerRoutes at same ROUTES_VERSION must not duplicate layers
+        assert.equal(plugin._internal.registerRoutes(express5App), true);
+        assert.equal(express5App.router.stack.length, 5);
+    } finally {
+        fs.rmSync(tmpDatapath, { recursive: true, force: true });
+    }
+}
+
 async function main() {
     testManifest();
     testPrepExportsCompatibility();
@@ -783,6 +896,7 @@ async function main() {
     await testBitrixPaginationSettingsAndResilience();
     await testFrontendInlineUi();
     await testPerUserOAuthAndMiniChat();
+    await testOAuthServerDomainAndRoutePromotion();
     console.log('All b24contacts tests passed!');
 }
 

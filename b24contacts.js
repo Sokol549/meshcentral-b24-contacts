@@ -1006,13 +1006,59 @@ function createPlugin(parent) {
         };
     }
 
+    function extractAllowedHost(raw) {
+        var str = String(raw || '').trim();
+        if (!str) return '';
+        if (/^https?:\/\//i.test(str)) {
+            return new URL(str).hostname.toLowerCase();
+        }
+        if (/^[a-z0-9.-]+(?::\d+)?$/i.test(str)) {
+            return str.replace(/:\d+$/, '').toLowerCase();
+        }
+        return '';
+    }
+
+    function resolveOAuthTokenOrigin(serverDomain, portalOrigin) {
+        var host = extractAllowedHost(serverDomain);
+        if (!host) {
+            return portalOrigin;
+        }
+        if (host === 'oauth.bitrix24.tech' || host === 'oauth.bitrix.info') {
+            return 'https://' + host;
+        }
+        if (portalOrigin) {
+            var portalHost = new URL(portalOrigin).hostname.toLowerCase();
+            if (host === portalHost) {
+                return portalOrigin;
+            }
+        }
+        throw new Error('Недопустимый OAuth-сервер Битрикс24: ' + String(serverDomain || ''));
+    }
+
+    function resolveRestEndpoint(clientEndpoint, portalOrigin) {
+        var fallback = String(portalOrigin || '').replace(/\/+$/, '') + '/rest';
+        if (typeof clientEndpoint !== 'string' || !clientEndpoint.trim()) {
+            return fallback;
+        }
+        try {
+            var parsed = new URL(clientEndpoint.trim());
+            var portalUrl = portalOrigin ? new URL(portalOrigin) : null;
+            if ((parsed.protocol === 'https:' || (portalUrl && parsed.protocol === portalUrl.protocol)) &&
+                (!portalUrl || parsed.host.toLowerCase() === portalUrl.host.toLowerCase())) {
+                return parsed.origin + parsed.pathname.replace(/\/+$/, '');
+            }
+        } catch (e) {}
+        return fallback;
+    }
+
     async function refreshOAuthToken(settings, auth) {
         var portalOrigin = getSafePortalOrigin(settings);
         if (!portalOrigin || !settings.oauthClientId || !settings.oauthClientSecret || !auth || !auth.refreshToken) {
             throw new Error('Невозможно обновить OAuth-токен Битрикс24');
         }
+        var tokenOrigin = resolveOAuthTokenOrigin(auth.oauthTokenOrigin, portalOrigin);
         var data = await postForm(
-            portalOrigin + '/oauth/token/',
+            tokenOrigin + '/oauth/token/',
             {
                 grant_type: 'refresh_token',
                 client_id: settings.oauthClientId,
@@ -1032,7 +1078,9 @@ function createPlugin(parent) {
             mode: 'oauth',
             accessToken: String(data.access_token),
             refreshToken: data.refresh_token ? String(data.refresh_token) : auth.refreshToken,
-            expiresAt: Date.now() + expiresIn * 1000
+            expiresAt: Date.now() + expiresIn * 1000,
+            oauthTokenOrigin: tokenOrigin,
+            restBaseUrl: data.client_endpoint ? resolveRestEndpoint(data.client_endpoint, portalOrigin) : (auth.restBaseUrl || (portalOrigin + '/rest'))
         });
     }
 
@@ -1074,7 +1122,8 @@ function createPlugin(parent) {
             }
         }
 
-        var endpoint = portalOrigin + '/rest/' + String(method).replace(/\.json$/i, '') + '.json';
+        var restBase = resolveRestEndpoint(currentAuth.restBaseUrl, portalOrigin);
+        var endpoint = restBase + '/' + String(method).replace(/\.json$/i, '') + '.json';
         try {
             return await postJson(endpoint, Object.assign({}, params || {}, { auth: currentAuth.accessToken }), reqOpts);
         } catch (err) {
@@ -1083,7 +1132,9 @@ function createPlugin(parent) {
                 try {
                     currentAuth = await refreshOAuthToken(settings, currentAuth);
                     writeUserChatAuth(server, meshUserId, currentAuth);
-                    return await postJson(endpoint, Object.assign({}, params || {}, { auth: currentAuth.accessToken }), reqOpts);
+                    var refreshedBase = resolveRestEndpoint(currentAuth.restBaseUrl, portalOrigin);
+                    var refreshedEndpoint = refreshedBase + '/' + String(method).replace(/\.json$/i, '') + '.json';
+                    return await postJson(refreshedEndpoint, Object.assign({}, params || {}, { auth: currentAuth.accessToken }), reqOpts);
                 } catch (retryErr) {
                     deleteUserChatAuth(server, meshUserId);
                     var reloginErr = new Error('Сессия Битрикс24 истекла, войдите повторно');
@@ -1180,7 +1231,7 @@ function createPlugin(parent) {
         return await fetchChatMessagesForUser(meshUserId, safeDialogId, 4);
     }
 
-    async function completeOAuthCallback(code, state) {
+    async function completeOAuthCallback(code, state, serverDomain) {
         cleanupOAuthStates();
         var stateEntry = (typeof state === 'string' && oauthStates.has(state)) ? oauthStates.get(state) : null;
         if (!stateEntry) {
@@ -1194,8 +1245,9 @@ function createPlugin(parent) {
             throw new Error('OAuth-приложение Битрикс24 не настроено администратором MeshCentral.');
         }
 
+        var tokenOrigin = resolveOAuthTokenOrigin(serverDomain, portalOrigin);
         var tokenData = await postForm(
-            portalOrigin + '/oauth/token/',
+            tokenOrigin + '/oauth/token/',
             {
                 grant_type: 'authorization_code',
                 client_id: settings.oauthClientId,
@@ -1213,8 +1265,9 @@ function createPlugin(parent) {
             throw new Error('Битрикс24 не выдал access_token');
         }
 
+        var restBaseUrl = resolveRestEndpoint(tokenData.client_endpoint, portalOrigin);
         var meData = await postJson(
-            portalOrigin + '/rest/user.current.json',
+            restBaseUrl + '/user.current.json',
             { auth: String(tokenData.access_token) },
             {
                 timeoutMs: settings.requestTimeoutMs,
@@ -1230,6 +1283,8 @@ function createPlugin(parent) {
             accessToken: String(tokenData.access_token),
             refreshToken: tokenData.refresh_token ? String(tokenData.refresh_token) : '',
             expiresAt: Date.now() + expiresIn * 1000,
+            oauthTokenOrigin: tokenOrigin,
+            restBaseUrl: restBaseUrl,
             b24UserId: me.ID != null ? String(me.ID) : '',
             b24UserName: b24Name
         });
@@ -1276,10 +1331,20 @@ function createPlugin(parent) {
         }
     }
 
-    function getExpressApp() {
+    var ROUTES_VERSION = '1.3.1';
+
+    function getExpressApps() {
         var server = getServer();
-        if (!server) return null;
-        return server.app || (server.webserver && server.webserver.app) || null;
+        if (!server) return [];
+        var candidates = [server.webserver && server.webserver.app, server.app];
+        var apps = [];
+        for (var i = 0; i < candidates.length; i++) {
+            var a = candidates[i];
+            if (a && typeof a.get === 'function' && apps.indexOf(a) === -1) {
+                apps.push(a);
+            }
+        }
+        return apps;
     }
 
     function escapeHtmlText(str) {
@@ -1290,10 +1355,33 @@ function createPlugin(parent) {
             .replace(/"/g, '&quot;');
     }
 
+    function isOwnPluginRoutePath(routePath) {
+        return typeof routePath === 'string' && (
+            routePath.indexOf('/plugin/b24contacts/') === 0 ||
+            routePath.indexOf('/*/plugin/b24contacts/') === 0
+        );
+    }
+
     function registerRoutes(app) {
         if (!app || typeof app.get !== 'function') return false;
-        if (app._b24ContactsRoutesRegistered) return true;
-        app._b24ContactsRoutesRegistered = true;
+
+        var existingRouter = app._router || app.router;
+        if (app._b24ContactsRouteVer === ROUTES_VERSION && existingRouter && Array.isArray(existingRouter.stack)) {
+            var hasOAuthRoute = existingRouter.stack.some(function (layer) {
+                return layer && layer.route && layer.route.path === '/plugin/b24contacts/oauth/callback';
+            });
+            if (hasOAuthRoute) return true;
+        }
+
+        // Remove any older b24contacts layers before re-registering (supports updates without duplicate handlers)
+        if (existingRouter && Array.isArray(existingRouter.stack)) {
+            for (var r = existingRouter.stack.length - 1; r >= 0; r--) {
+                var oldPath = existingRouter.stack[r] && existingRouter.stack[r].route ? existingRouter.stack[r].route.path : '';
+                if (isOwnPluginRoutePath(oldPath)) {
+                    existingRouter.stack.splice(r, 1);
+                }
+            }
+        }
 
         app.get('/plugin/b24contacts/api/contacts', async function (req, res) {
             try {
@@ -1316,7 +1404,7 @@ function createPlugin(parent) {
             }
         });
 
-        app.get('/plugin/b24contacts/oauth/callback', async function (req, res) {
+        async function oauthCallbackHandler(req, res) {
             res.setHeader('Content-Type', 'text/html; charset=utf-8');
             res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
             try {
@@ -1326,7 +1414,7 @@ function createPlugin(parent) {
                 if (!req.query || !req.query.code || !req.query.state) {
                     throw new Error('Отсутствуют параметры code или state от Битрикс24');
                 }
-                await completeOAuthCallback(req.query.code, req.query.state);
+                await completeOAuthCallback(req.query.code, req.query.state, req.query.server_domain);
                 return res.status(200).send(
                     '<!doctype html><meta charset="utf-8"><title>Битрикс24</title>' +
                     '<body style="font:14px Arial,sans-serif;padding:24px;text-align:center">' +
@@ -1343,35 +1431,55 @@ function createPlugin(parent) {
                     '</body>'
                 );
             }
-        });
+        }
+
+        app.get('/plugin/b24contacts/oauth/callback', oauthCallbackHandler);
+        app.get('/*/plugin/b24contacts/oauth/callback', oauthCallbackHandler);
 
         // Promote plugin routes ahead of MeshCentral's catch-all 404 middleware (Express 4 & Express 5)
+        var insertIdx = 0;
+        var layersCount = 0;
+        var stackLen = 0;
         var routerObj = app._router || app.router;
         if (routerObj && Array.isArray(routerObj.stack)) {
             var stack = routerObj.stack;
             var layers = [];
             for (var i = stack.length - 1; i >= 0; i--) {
                 var routePath = stack[i] && stack[i].route ? stack[i].route.path : '';
-                if (typeof routePath === 'string' && routePath.indexOf('/plugin/b24contacts/') === 0) {
+                if (isOwnPluginRoutePath(routePath)) {
                     layers.unshift(stack.splice(i, 1)[0]);
                 }
             }
             if (layers.length > 0) {
-                stack.splice(2, 0, ...layers);
+                while (insertIdx < stack.length && stack[insertIdx] && (stack[insertIdx].name === 'query' || stack[insertIdx].name === 'expressInit')) {
+                    insertIdx++;
+                }
+                stack.splice(insertIdx, 0, ...layers);
+                layersCount = layers.length;
+                stackLen = stack.length;
             }
         }
 
-        console.log('[b24contacts] HTTP-маршруты плагина зарегистрированы.');
+        app._b24ContactsRouteVer = ROUTES_VERSION;
+        app._b24ContactsRoutesRegistered = true;
+        console.log('[b24contacts] HTTP-маршруты плагина v' + ROUTES_VERSION + ' зарегистрированы (слоев: ' + layersCount + ', позиция: ' + insertIdx + '/' + stackLen + ').');
         return true;
     }
 
     function tryRegisterRoutes(attemptsLeft) {
         routesRetryTimer = null;
+        var registeredAny = false;
         try {
-            if (registerRoutes(getExpressApp())) return;
+            var apps = getExpressApps();
+            for (var i = 0; i < apps.length; i++) {
+                if (registerRoutes(apps[i])) {
+                    registeredAny = true;
+                }
+            }
         } catch (e) {
             console.warn('[b24contacts] Не удалось зарегистрировать HTTP-маршруты:', e.message);
         }
+        if (registeredAny) return;
         if (attemptsLeft > 0) {
             routesRetryTimer = setTimeout(function () { tryRegisterRoutes(attemptsLeft - 1); }, 1000);
             if (routesRetryTimer && typeof routesRetryTimer.unref === 'function') {
@@ -1872,6 +1980,9 @@ function createPlugin(parent) {
         writeSavedSettings: writeSavedSettings,
         readUserChatAuth: readUserChatAuth,
         writeUserChatAuth: writeUserChatAuth,
+        resolveOAuthTokenOrigin: resolveOAuthTokenOrigin,
+        resolveRestEndpoint: resolveRestEndpoint,
+        registerRoutes: registerRoutes,
         completeOAuthCallback: completeOAuthCallback,
         oauthStates: oauthStates,
         refreshCache: refreshCache,
