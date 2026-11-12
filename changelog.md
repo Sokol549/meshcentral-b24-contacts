@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.0
+- Added a full-featured **Bitrix24 Chats** tab in the MeshCentral left sidebar (`#page_leftbar`) displaying all recent Bitrix24 chats (`im.recent.list`) with search, unread filter, full message history, linked PC quick-jump buttons, and unread counter badge.
+- Added unread highlighting for synced computers in the MeshCentral device list (`#xdevices`): device rows and icons glow/highlight with a clickable unread count badge (`💬 N`) when their matched Bitrix24 contact has unread messages (unsynced computers are not highlighted).
+- Enabled automatic read confirmation (`im.dialog.read`) whenever a chat is opened in either the left Chats tab or the Device Summary mini-chat.
+
 ## 1.4.0
 - Added manual device-to-Bitrix24 user binding in the plugin settings modal (`⚙`) and quick **«Привязать вручную»** button when automatic matching finds no profile.
 - Added searchable Bitrix24 user picker and management list of all manual bindings stored persistently in `b24contacts-settings.json` (`manualLinks`).

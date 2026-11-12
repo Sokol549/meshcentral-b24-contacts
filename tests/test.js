@@ -30,7 +30,7 @@ function createMockParent(config, datapath, extra) {
 
 function makeDomShim() {
     function makeElement(tag) {
-        return {
+        const el = {
             tagName: String(tag || 'div').toUpperCase(),
             id: '',
             className: '',
@@ -47,13 +47,48 @@ function makeDomShim() {
             children: [],
             parentNode: null,
             attributes: {},
-            setAttribute: function (k, v) { this.attributes[k] = String(v); if (k === 'id') this.id = String(v); },
+            setAttribute: function (k, v) {
+                this.attributes[k] = String(v);
+                if (k === 'id') this.id = String(v);
+                if (k === 'class') this.className = String(v);
+            },
+            getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null; },
             addEventListener: function () {},
+            get parentElement() { return this.parentNode; },
             get firstChild() { return this.children[0] || null; },
             get nextSibling() {
                 if (!this.parentNode) return null;
                 const idx = this.parentNode.children.indexOf(this);
                 return idx >= 0 ? (this.parentNode.children[idx + 1] || null) : null;
+            },
+            contains: function (target) {
+                if (!target) return false;
+                if (target === this) return true;
+                for (const ch of this.children) {
+                    if (ch.contains && ch.contains(target)) return true;
+                }
+                return false;
+            },
+            classList: {
+                add: function (...names) {
+                    const set = new Set(String(el.className || '').split(/\s+/).filter(Boolean));
+                    for (const n of names) if (n) set.add(n);
+                    el.className = Array.from(set).join(' ');
+                },
+                remove: function (...names) {
+                    const drop = new Set(names);
+                    el.className = String(el.className || '').split(/\s+/).filter((c) => c && !drop.has(c)).join(' ');
+                },
+                contains: function (name) {
+                    return String(el.className || '').split(/\s+/).includes(name);
+                },
+                toggle: function (name, force) {
+                    const has = this.contains(name);
+                    const next = force !== undefined ? Boolean(force) : !has;
+                    if (next) this.add(name);
+                    else this.remove(name);
+                    return next;
+                }
             },
             appendChild: function (child) {
                 child.parentNode = this;
@@ -75,32 +110,61 @@ function makeDomShim() {
             replaceChildren: function () {
                 this.children = [];
             },
+            removeChild: function (child) {
+                this.children = this.children.filter((c) => c !== child);
+                if (child && child.parentNode === this) child.parentNode = null;
+                return child;
+            },
             remove: function () {
                 if (this.parentNode) {
                     this.parentNode.children = this.parentNode.children.filter((c) => c !== this);
                     this.parentNode = null;
                 }
             },
-            querySelector: function (sel) {
+            querySelectorAll: function (sel) {
                 if (sel === '#p2AccountActions > p.mL') {
                     const p2a = findById(this, 'p2AccountActions');
-                    if (p2a) return p2a.children.find((c) => c.tagName === 'P' && c.className === 'mL') || null;
-                    return null;
+                    if (p2a) {
+                        const hit = p2a.children.find((c) => c.tagName === 'P' && c.className === 'mL');
+                        return hit ? [hit] : [];
+                    }
+                    return [];
                 }
+                const matchesPart = (node, part) => {
+                    part = part.trim();
+                    if (!part) return false;
+                    if (part.includes(' ')) {
+                        const tokens = part.split(/\s+/).filter(Boolean);
+                        if (tokens.length === 2 && tokens[0].startsWith('#')) {
+                            const anc = findById(this, tokens[0].slice(1));
+                            if (!anc || !anc.contains(node) || anc === node) return false;
+                            part = tokens[1];
+                        }
+                    }
+                    if (part.startsWith('#')) return node.id === part.slice(1);
+                    if (part.startsWith('.')) return node.className.split(/\s+/).includes(part.slice(1));
+                    if (part === '[value^="devid_"]') return typeof node.value === 'string' && node.value.startsWith('devid_');
+                    if (part === '[id^="devid_"]') return typeof node.id === 'string' && node.id.startsWith('devid_');
+                    if (part.startsWith('[class*="Icon"]')) return node.className.includes('Icon');
+                    if (part.startsWith('[class*="icon"]')) return node.className.includes('icon') && !node.className.split(/\s+/).includes('b24c-icon');
+                    if (!part.startsWith('[') && !part.includes(':')) return node.tagName.toLowerCase() === part.toLowerCase();
+                    return false;
+                };
                 const parts = sel.split(',').map((s) => s.trim()).filter(Boolean);
+                const out = [];
                 const stack = [...this.children];
                 while (stack.length) {
                     const node = stack.shift();
-                    for (const part of parts) {
-                        if (part.startsWith('#') && node.id === part.slice(1)) return node;
-                        if (part.startsWith('.') && node.className.split(/\s+/).includes(part.slice(1))) return node;
-                        if (!part.startsWith('#') && !part.startsWith('.') && node.tagName.toLowerCase() === part.toLowerCase()) return node;
-                    }
+                    if (parts.some((p) => matchesPart(node, p))) out.push(node);
                     stack.push(...node.children);
                 }
-                return null;
+                return out;
+            },
+            querySelector: function (sel) {
+                return this.querySelectorAll(sel)[0] || null;
             }
         };
+        return el;
     }
 
     function findById(root, id) {
@@ -357,6 +421,7 @@ function testRealMeshCentralPluginHandler() {
         assert.equal(typeof clientHandler.b24contacts.onContactsResult, 'function');
         assert.equal(typeof clientHandler.b24contacts.onSettingsResult, 'function');
         assert.equal(typeof clientHandler.b24contacts.openSettings, 'function');
+        assert.equal(typeof clientHandler.b24contacts.goPageStart, 'function');
     } finally {
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -715,6 +780,10 @@ async function testPerUserOAuthAndMiniChat() {
                 res.end(JSON.stringify({ result: 999 }));
                 return;
             }
+            if (req.url === '/rest/im.dialog.read.json') {
+                res.end(JSON.stringify({ result: true }));
+                return;
+            }
             res.statusCode = 404;
             res.end(JSON.stringify({ error: 'UNKNOWN' }));
         });
@@ -1033,6 +1102,247 @@ async function testManualDeviceBinding() {
     }
 }
 
+async function testLeftbarChatsTabAndUnreadHighlighting() {
+    const mockUsers = [
+        { ID: '101', ACTIVE: true, NAME: 'ВА | Калининская ул. Советская 38 - ЮБ', WORK_PHONE: '+78616321000' }
+    ];
+    let unreadCounts = { '101': 2, '202': 1, 'chat55': 3 };
+    const readCalls = [];
+
+    const server = http.createServer((req, res) => {
+        let raw = '';
+        req.on('data', (c) => { raw += c; });
+        req.on('end', () => {
+            res.setHeader('Content-Type', 'application/json');
+            if (req.url.endsWith('/user.get.json')) {
+                res.end(JSON.stringify({ result: mockUsers, total: 1 }));
+                return;
+            }
+            if (req.url.endsWith('/user.current.json')) {
+                res.end(JSON.stringify({ result: { ID: '77', NAME: 'Иван', LAST_NAME: 'Соколов' } }));
+                return;
+            }
+            const parsed = JSON.parse(raw || '{}');
+            if (req.url.endsWith('/im.recent.list.json')) {
+                res.end(JSON.stringify({
+                    result: {
+                        items: [
+                            {
+                                id: '101',
+                                type: 'user',
+                                title: 'ВА | Калининская ул. Советская 38 - ЮБ',
+                                counter: unreadCounts['101'] || 0,
+                                message: { id: 501, date: '2026-11-12T10:01:00+03:00', text: 'Не печатает чек' }
+                            },
+                            {
+                                id: '202',
+                                type: 'user',
+                                title: 'Иван Петров',
+                                counter: unreadCounts['202'] || 0,
+                                message: { id: 502, date: '2026-11-12T10:02:00+03:00', text: 'Привет, зайди в офис' }
+                            },
+                            {
+                                id: 'chat55',
+                                type: 'chat',
+                                chat_id: 55,
+                                title: 'Общий чат ИТ',
+                                counter: unreadCounts['chat55'] || 0,
+                                message: { id: 503, date: '2026-11-12T10:03:00+03:00', text: 'Обновление ночью' }
+                            }
+                        ]
+                    }
+                }));
+                return;
+            }
+            if (req.url.endsWith('/im.dialog.messages.get.json')) {
+                res.end(JSON.stringify({
+                    result: {
+                        messages: [{ id: 501, author_id: 101, date: '2026-11-12T10:01:00+03:00', text: 'Не печатает чек' }],
+                        users: [{ id: 101, name: 'ВА | Калининская ул. Советская 38 - ЮБ' }]
+                    }
+                }));
+                return;
+            }
+            if (req.url.endsWith('/im.dialog.read.json')) {
+                readCalls.push(parsed.DIALOG_ID);
+                unreadCounts[String(parsed.DIALOG_ID)] = 0;
+                res.end(JSON.stringify({ result: true }));
+                return;
+            }
+            res.statusCode = 404;
+            res.end(JSON.stringify({ error: 'UNKNOWN' }));
+        });
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const tmpDatapath = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-b24-leftbar-'));
+
+    try {
+        const base = 'http://127.0.0.1:' + port;
+        const plugin = pluginFactory(createMockParent({
+            settings: {
+                plugins: {
+                    enabled: true,
+                    b24contacts: {
+                        webhookUrl: base + '/rest/1/tok/',
+                        portalUrl: base
+                    }
+                }
+            }
+        }, tmpDatapath));
+
+        await plugin._internal.refreshCache('test-leftbar');
+        const userObj = { _id: 'user//op1', siteadmin: 0 };
+
+        // Sign in operator via personal webhook
+        const authRes = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'savePersonalWebhook', requestId: 'lb0', webhookUrl: base + '/rest/77/op_tok/' },
+                { user: userObj, send: resolve }
+            );
+        });
+        assert.equal(authRes.ok, true);
+
+        const clientNodes = [
+            { id: 'node//kalin', name: 'ст.Калининская ул.Советская, д.38 - касса ИБ' },
+            { id: 'node//unmatched', name: 'Сервер резервный без Битрикса' }
+        ];
+
+        // Server overview returns ALL dialogs, but unreadNodeIds ONLY for synced PCs
+        const overview1 = await new Promise((resolve) => {
+            plugin.serveraction(
+                { pluginaction: 'getChatOverview', requestId: 'lb1', includeDialogs: true, nodes: clientNodes },
+                { user: userObj, send: resolve }
+            );
+        });
+        assert.equal(overview1.ok, true);
+        assert.equal(overview1.unreadTotal, 6);
+        assert.equal(overview1.dialogs.length, 3);
+        assert.ok(overview1.unreadNodeIds['node//kalin'], 'Synced PC should be marked unread');
+        assert.equal(overview1.unreadNodeIds['node//kalin'].count, 2);
+        assert.equal(overview1.unreadNodeIds['node//unmatched'], undefined, 'Unsynced PC must NOT be highlighted');
+
+        // Frontend VM DOM verification for #page_leftbar, #xdevices highlighting & chats page
+        const dom = makeDomShim();
+        const pageLeftbar = dom.makeElement('div');
+        pageLeftbar.id = 'page_leftbar';
+        const nativeNavBtn = dom.makeElement('div');
+        nativeNavBtn.setAttribute('onclick', 'go(1)');
+        const spacer = dom.makeElement('div');
+        pageLeftbar.appendChild(nativeNavBtn);
+        pageLeftbar.appendChild(spacer);
+
+        const columnL = dom.makeElement('div');
+        columnL.id = 'column_l';
+        const p1 = dom.makeElement('div');
+        p1.id = 'p1';
+        const xdevices = dom.makeElement('div');
+        xdevices.id = 'xdevices';
+
+        const makeDeviceRow = (id, title) => {
+            const row = dom.makeElement('div');
+            row.className = 'listItem';
+            const chk = dom.makeElement('input');
+            chk.className = 'DeviceCheckbox';
+            chk.value = 'devid_' + id;
+            const icon = dom.makeElement('div');
+            icon.className = 'i32';
+            const nameSpan = dom.makeElement('span');
+            nameSpan.textContent = title;
+            row.appendChild(chk);
+            row.appendChild(icon);
+            row.appendChild(nameSpan);
+            return { row, icon };
+        };
+        const kalinRow = makeDeviceRow('node//kalin', 'ст.Калининская ул.Советская, д.38');
+        const unmatchedRow = makeDeviceRow('node//unmatched', 'Сервер резервный');
+        xdevices.appendChild(kalinRow.row);
+        xdevices.appendChild(unmatchedRow.row);
+        p1.appendChild(xdevices);
+        columnL.appendChild(p1);
+        dom.body.appendChild(pageLeftbar);
+        dom.body.appendChild(columnL);
+
+        const sandbox = {
+            window: {
+                userinfo: userObj,
+                currentNode: null,
+                location: { origin: 'https://mc.kzvs.pro' }
+            },
+            document: {
+                head: dom.head,
+                body: dom.body,
+                hidden: false,
+                addEventListener: () => {},
+                getElementById: (id) => dom.findById(dom.head, id) || dom.findById(dom.body, id),
+                querySelector: (sel) => dom.body.querySelector(sel),
+                querySelectorAll: (sel) => dom.body.querySelectorAll(sel),
+                createElement: (tag) => dom.makeElement(tag),
+                createElementNS: (_ns, tag) => dom.makeElement(tag)
+            },
+            nodes: clientNodes.map((n) => ({ _id: n.id, name: n.name })),
+            xxcurrentView: 1,
+            meshserver: {
+                send: (msg) => {
+                    plugin.serveraction(msg, {
+                        user: userObj,
+                        send: (reply) => {
+                            if (reply.method === 'onChatResult') {
+                                sandbox.window.B24ContactsPlugin.onChatResult(reply);
+                            }
+                        }
+                    });
+                }
+            },
+            setTimeout,
+            clearTimeout,
+            setInterval: () => ({ unref: () => {} }),
+            clearInterval: () => {},
+            Map
+        };
+        sandbox.window.document = sandbox.document;
+        sandbox.window.meshserver = sandbox.meshserver;
+
+        vm.runInNewContext('(' + plugin.onWebUIStartupEnd.toString() + ')()', sandbox);
+
+        const leftTab = dom.findById(pageLeftbar, 'b24c-leftbar-tab');
+        assert.ok(leftTab, 'Leftbar tab button should be injected into #page_leftbar');
+        assert.equal(pageLeftbar.children[1], leftTab, 'Leftbar tab should be placed before trailing spacer');
+
+        await sandbox.window.B24ContactsPlugin.refreshOverview(true);
+
+        const leftBadge = dom.findById(pageLeftbar, 'b24c-leftbar-badge');
+        assert.equal(leftBadge.textContent, '6');
+        assert.ok(leftBadge.classList.contains('visible'));
+        assert.ok(kalinRow.row.classList.contains('b24c-dev-unread'), 'Synced PC row should be highlighted');
+        assert.ok(kalinRow.icon.classList.contains('b24c-dev-icon-unread'), 'Synced PC icon should be highlighted');
+        assert.equal(kalinRow.row.querySelector('.b24c-dev-msg-badge').textContent, '💬 2');
+        assert.ok(!unmatchedRow.row.classList.contains('b24c-dev-unread'), 'Unsynced PC row must NOT be highlighted');
+        assert.equal(unmatchedRow.row.querySelector('.b24c-dev-msg-badge'), null);
+
+        // Open chats tab and open dialog 101 -> automatically marks read on Bitrix24 & clears highlight
+        sandbox.window.B24ContactsPlugin.openChats('101');
+        await new Promise((r) => setTimeout(r, 30));
+
+        const chatsPage = dom.findById(columnL, 'b24c-chats-page');
+        assert.ok(chatsPage.classList.contains('visible'));
+        assert.equal(p1.style.display, 'none');
+        assert.equal(chatsPage.querySelectorAll('.b24c-dialog-item').length, 3, 'Chats tab must display all Bitrix24 chats');
+        assert.ok(readCalls.includes('101'), 'Opening chat must automatically call im.dialog.read');
+        assert.equal(leftBadge.textContent, '4', 'Leftbar unread badge should decrease after reading dialog 101');
+        assert.ok(!kalinRow.row.classList.contains('b24c-dev-unread'), 'PC highlight should clear after reading dialog 101');
+
+        // Switching back via MeshCentral goPageStart hides chats page
+        sandbox.window.B24ContactsPlugin.goPageStart(1);
+        assert.ok(!chatsPage.classList.contains('visible'));
+        assert.ok(!leftTab.classList.contains('active'));
+    } finally {
+        fs.rmSync(tmpDatapath, { recursive: true, force: true });
+        await new Promise((resolve) => server.close(resolve));
+    }
+}
+
 async function main() {
     testManifest();
     testPrepExportsCompatibility();
@@ -1043,6 +1353,7 @@ async function main() {
     await testPerUserOAuthAndMiniChat();
     await testOAuthServerDomainAndRoutePromotion();
     await testManualDeviceBinding();
+    await testLeftbarChatsTabAndUnreadHighlighting();
     console.log('All b24contacts tests passed!');
 }
 

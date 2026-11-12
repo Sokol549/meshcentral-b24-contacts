@@ -1221,12 +1221,34 @@ function createPlugin(parent) {
         }
     }
 
-    async function fetchChatMessagesForUser(meshUserId, dialogId, limit) {
+    function validateDialogId(dialogId) {
         var safeDialogId = typeof dialogId === 'string' || typeof dialogId === 'number' ? String(dialogId).trim() : '';
         if (!/^[a-zA-Z0-9_-]+$/.test(safeDialogId)) {
             throw new Error('Некорректный идентификатор диалога Битрикс24');
         }
-        var maxCount = clampNumber(limit, 4, 1, 20);
+        return safeDialogId;
+    }
+
+    async function markDialogReadForUser(meshUserId, dialogId, lastMessageId) {
+        var safeDialogId = validateDialogId(dialogId);
+        var params = { DIALOG_ID: safeDialogId };
+        var msgId = Number(lastMessageId);
+        if (Number.isFinite(msgId) && msgId > 0) {
+            params.MESSAGE_ID = msgId;
+        }
+        try {
+            await callBitrixAsUser(meshUserId, 'im.dialog.read', params);
+            return true;
+        } catch (err) {
+            if (err && err.authRequired) throw err;
+            console.warn('[b24contacts] Не удалось отметить диалог прочитанным:', err && err.message);
+            return false;
+        }
+    }
+
+    async function fetchChatMessagesForUser(meshUserId, dialogId, limit, markRead) {
+        var safeDialogId = validateDialogId(dialogId);
+        var maxCount = clampNumber(limit, 4, 1, 50);
         var auth = readUserChatAuth(getServer(), meshUserId);
         var myB24Id = auth && auth.b24UserId ? String(auth.b24UserId) : '';
 
@@ -1275,8 +1297,13 @@ function createPlugin(parent) {
         });
 
         normalized.sort(function (a, b) { return a.id - b.id; });
+        var maxMsgId = normalized.length ? normalized[normalized.length - 1].id : 0;
         if (normalized.length > maxCount) {
             normalized = normalized.slice(normalized.length - maxCount);
+        }
+
+        if (markRead) {
+            await markDialogReadForUser(meshUserId, safeDialogId, maxMsgId);
         }
 
         return {
@@ -1285,11 +1312,8 @@ function createPlugin(parent) {
         };
     }
 
-    async function sendChatMessageForUser(meshUserId, dialogId, messageText) {
-        var safeDialogId = typeof dialogId === 'string' || typeof dialogId === 'number' ? String(dialogId).trim() : '';
-        if (!/^[a-zA-Z0-9_-]+$/.test(safeDialogId)) {
-            throw new Error('Некорректный идентификатор диалога Битрикс24');
-        }
+    async function sendChatMessageForUser(meshUserId, dialogId, messageText, limit) {
+        var safeDialogId = validateDialogId(dialogId);
         var text = typeof messageText === 'string' ? messageText.trim() : '';
         if (!text) throw new Error('Введите текст сообщения');
         if (text.length > 4000) throw new Error('Сообщение слишком длинное (максимум 4000 символов)');
@@ -1299,7 +1323,183 @@ function createPlugin(parent) {
             MESSAGE: text
         });
 
-        return await fetchChatMessagesForUser(meshUserId, safeDialogId, 4);
+        return await fetchChatMessagesForUser(meshUserId, safeDialogId, limit || 4, true);
+    }
+
+    async function fetchRecentDialogsForUser(meshUserId) {
+        var data = await callBitrixAsUser(meshUserId, 'im.recent.list', {});
+        var result = (data && data.result) || {};
+        var items = Array.isArray(result.items) ? result.items : (Array.isArray(result) ? result : []);
+
+        var settings = getSettings();
+        var portalOrigin = getSafePortalOrigin(settings);
+        var cacheById = new Map();
+        for (var i = 0; i < cache.users.length; i++) {
+            var cu = cache.users[i];
+            if (cu && cu.id != null) cacheById.set(String(cu.id), cu);
+        }
+
+        var dialogs = [];
+        var unreadTotal = 0;
+        var unreadDialogsCount = 0;
+
+        for (var j = 0; j < items.length; j++) {
+            var item = items[j];
+            if (!item || typeof item !== 'object') continue;
+            var dialogId = '';
+            if (item.id != null) {
+                dialogId = String(item.id).trim();
+            } else if (item.chat_id != null) {
+                dialogId = 'chat' + String(item.chat_id).trim();
+            }
+            if (!dialogId || !/^[a-zA-Z0-9_-]+$/.test(dialogId)) continue;
+
+            var type = String(item.type || (dialogId.indexOf('chat') === 0 ? 'chat' : 'user'));
+            var userObj = (item.user && typeof item.user === 'object') ? item.user : null;
+            var cachedProfile = cacheById.get(dialogId) || null;
+            var title = (typeof item.title === 'string' && item.title.trim()) ? item.title.trim() : '';
+            if (!title && userObj) {
+                title = (typeof userObj.name === 'string' && userObj.name.trim())
+                    ? userObj.name.trim()
+                    : [userObj.first_name, userObj.last_name].filter(Boolean).join(' ').trim();
+            }
+            if (!title && cachedProfile) {
+                title = cachedProfile.displayName;
+            }
+            if (!title) {
+                title = (type === 'chat' ? 'Групповой чат #' : 'Пользователь #') + dialogId;
+            }
+
+            var counter = Math.max(0, Number(item.counter) || 0);
+            var manualUnread = Boolean(item.unread);
+            var effectiveUnread = counter > 0 ? counter : (manualUnread ? 1 : 0);
+            if (effectiveUnread > 0) {
+                unreadTotal += effectiveUnread;
+                unreadDialogsCount++;
+            }
+
+            var msg = (item.message && typeof item.message === 'object') ? item.message : {};
+            var lastText = cleanBitrixBbCode(msg.text != null ? String(msg.text) : '');
+            if (!lastText && Array.isArray(msg.params && msg.params.FILE_ID) && msg.params.FILE_ID.length) {
+                lastText = '[Файл]';
+            }
+
+            var links = type === 'user' ? buildBitrixUserLinks(dialogId, portalOrigin) : { chatUrl: '', profileUrl: '' };
+            dialogs.push({
+                dialogId: dialogId,
+                type: type,
+                title: title,
+                counter: effectiveUnread,
+                unread: effectiveUnread > 0,
+                pinned: Boolean(item.pinned),
+                lastMessage: {
+                    id: Number(msg.id) || 0,
+                    date: msg.date ? String(msg.date) : '',
+                    text: lastText || '',
+                    authorId: msg.author_id != null ? String(msg.author_id) : ''
+                },
+                phones: cachedProfile && Array.isArray(cachedProfile.phones) ? cachedProfile.phones : [],
+                chatUrl: links.chatUrl,
+                profileUrl: links.profileUrl
+            });
+        }
+
+        return {
+            dialogs: dialogs,
+            unreadTotal: unreadTotal,
+            unreadDialogsCount: unreadDialogsCount,
+            auth: getUserChatAuthStatus(meshUserId, settings)
+        };
+    }
+
+    var settingsRevCounter = 0;
+    var nodeBindingsMemo = new Map();
+
+    async function resolveClientNodeBindings(client, rawNodes) {
+        var settings = getSettings();
+        if (settings.webhookUrl && cache.users.length === 0) {
+            try { await ensureCacheReady(); } catch (e) {}
+        }
+
+        var list = Array.isArray(rawNodes) ? rawNodes.slice(0, 5000) : [];
+        var normalized = [];
+        var hash = crypto.createHash('sha1');
+        for (var i = 0; i < list.length; i++) {
+            var item = list[i];
+            if (!item || typeof item !== 'object') continue;
+            var nid = typeof item.id === 'string' ? item.id.trim().slice(0, 128) : '';
+            var nname = typeof item.name === 'string' ? item.name.slice(0, 512) : '';
+            if (!nid) continue;
+            normalized.push({ id: nid, name: nname });
+            hash.update(nid + '\0' + nname + '\n');
+        }
+
+        var userId = (client && client.user && client.user._id) ? String(client.user._id) : 'anon';
+        var memoKey = userId + '|' + String(cache.lastUpdated) + '|' + String(settingsRevCounter) + '|' + String(settings.minMatchScore) + '|' + hash.digest('hex');
+        if (nodeBindingsMemo.has(memoKey)) {
+            return nodeBindingsMemo.get(memoKey);
+        }
+
+        var cacheById = new Map();
+        for (var u = 0; u < cache.users.length; u++) {
+            if (cache.users[u] && cache.users[u].id != null) {
+                cacheById.set(String(cache.users[u].id), cache.users[u]);
+            }
+        }
+
+        var nodeToB24 = {};
+        var b24ToNodes = {};
+
+        for (var k = 0; k < normalized.length; k++) {
+            var nodeInfo = normalized[k];
+            var manualEntry = (settings.manualLinks && settings.manualLinks[nodeInfo.id])
+                ? settings.manualLinks[nodeInfo.id]
+                : null;
+            var matchedB24Id = '';
+            var matchedB24Name = '';
+            var isManual = false;
+
+            if (manualEntry && manualEntry.b24UserId) {
+                var hasAccess = await verifyNodeAccess(client, nodeInfo.id);
+                if (hasAccess) {
+                    var manualUser = cacheById.get(String(manualEntry.b24UserId));
+                    if (manualUser) {
+                        matchedB24Id = String(manualUser.id);
+                        matchedB24Name = manualUser.displayName;
+                        isManual = true;
+                    }
+                }
+            }
+
+            if (!matchedB24Id && nodeInfo.name && cache.users.length > 0) {
+                var match = findBestContactMatch(nodeInfo.name, cache.users, settings.minMatchScore);
+                if (match.matched && match.profile && match.profile.id) {
+                    matchedB24Id = String(match.profile.id);
+                    matchedB24Name = match.profile.displayName || '';
+                }
+            }
+
+            if (matchedB24Id) {
+                nodeToB24[nodeInfo.id] = {
+                    b24UserId: matchedB24Id,
+                    b24UserName: matchedB24Name,
+                    manualLinked: isManual
+                };
+                if (!b24ToNodes[matchedB24Id]) b24ToNodes[matchedB24Id] = [];
+                b24ToNodes[matchedB24Id].push({
+                    nodeId: nodeInfo.id,
+                    nodeName: nodeInfo.name || nodeInfo.id,
+                    manualLinked: isManual
+                });
+            }
+        }
+
+        if (nodeBindingsMemo.size > 32) {
+            nodeBindingsMemo.clear();
+        }
+        var res = { nodeToB24: nodeToB24, b24ToNodes: b24ToNodes };
+        nodeBindingsMemo.set(memoKey, res);
+        return res;
     }
 
     async function completeOAuthCallback(code, state, serverDomain) {
@@ -1449,7 +1649,7 @@ function createPlugin(parent) {
         }
     }
 
-    var ROUTES_VERSION = '1.4.0';
+    var ROUTES_VERSION = '1.5.0';
 
     function getExpressApps() {
         var server = getServer();
@@ -1805,6 +2005,7 @@ function createPlugin(parent) {
                         manualLinks: current.manualLinks || {}
                     };
                     writeSavedSettings(getServer(), nextSettings);
+                    settingsRevCounter++;
                     rescheduleRefreshTimer(nextSettings);
 
                     var ok = false;
@@ -1903,6 +2104,7 @@ function createPlugin(parent) {
                         manualLinks: nextLinks
                     };
                     writeSavedSettings(getServer(), nextSettings);
+                    settingsRevCounter++;
 
                     sendToClient(client, Object.assign({
                         action: 'plugin',
@@ -2111,17 +2313,19 @@ function createPlugin(parent) {
         if (action === 'getChatMessages') {
             var chatNodeId = typeof command.nodeId === 'string' ? command.nodeId : '';
             var dialogId = typeof command.dialogId === 'string' ? command.dialogId : '';
+            var shouldMarkRead = Boolean(command.markRead);
             (async function () {
                 try {
                     var hasAccess = await verifyNodeAccess(client, chatNodeId);
                     if (!hasAccess) throw new Error('Доступ к устройству запрещён');
-                    var res = await fetchChatMessagesForUser(client.user._id, dialogId, command.limit || 4);
+                    var res = await fetchChatMessagesForUser(client.user._id, dialogId, command.limit || 4, shouldMarkRead);
                     sendToClient(client, {
                         action: 'plugin',
                         plugin: PLUGIN_NAME,
                         method: 'onChatResult',
                         requestId: requestId,
                         dialogId: dialogId,
+                        markedRead: shouldMarkRead,
                         ok: true,
                         messages: res.messages,
                         auth: res.auth
@@ -2151,7 +2355,7 @@ function createPlugin(parent) {
                 try {
                     var hasAccess = await verifyNodeAccess(client, sendNodeId);
                     if (!hasAccess) throw new Error('Доступ к устройству запрещён');
-                    var res = await sendChatMessageForUser(client.user._id, sendDialogId, msgText);
+                    var res = await sendChatMessageForUser(client.user._id, sendDialogId, msgText, command.limit || 4);
                     sendToClient(client, {
                         action: 'plugin',
                         plugin: PLUGIN_NAME,
@@ -2177,6 +2381,117 @@ function createPlugin(parent) {
                     });
                 }
             })();
+            return;
+        }
+
+        if (action === 'markChatRead') {
+            var readDialogId = typeof command.dialogId === 'string' ? command.dialogId : '';
+            (async function () {
+                try {
+                    await markDialogReadForUser(client.user._id, readDialogId, command.lastMessageId);
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        dialogId: readDialogId,
+                        ok: true,
+                        markedRead: true
+                    });
+                } catch (err) {
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        dialogId: readDialogId,
+                        ok: false,
+                        authRequired: Boolean(err && err.authRequired),
+                        auth: getUserChatAuthStatus(client.user._id),
+                        error: err && err.message ? err.message : 'Не удалось отметить чат прочитанным'
+                    });
+                }
+            })();
+            return;
+        }
+
+        if (action === 'getChatOverview') {
+            (async function () {
+                try {
+                    var authStatus = getUserChatAuthStatus(client.user._id);
+                    if (!authStatus.authenticated) {
+                        sendToClient(client, {
+                            action: 'plugin',
+                            plugin: PLUGIN_NAME,
+                            method: 'onChatResult',
+                            requestId: requestId,
+                            ok: true,
+                            authenticated: false,
+                            auth: authStatus,
+                            unreadTotal: 0,
+                            unreadDialogsCount: 0,
+                            dialogs: [],
+                            unreadNodeIds: {},
+                            nodeToB24: {}
+                        });
+                        return;
+                    }
+
+                    var results = await Promise.all([
+                        fetchRecentDialogsForUser(client.user._id),
+                        resolveClientNodeBindings(client, command.nodes)
+                    ]);
+                    var recent = results[0];
+                    var bindings = results[1];
+
+                    var unreadNodeIds = {};
+                    var dialogsOut = [];
+                    for (var i = 0; i < recent.dialogs.length; i++) {
+                        var d = recent.dialogs[i];
+                        var linkedNodes = bindings.b24ToNodes[d.dialogId] || [];
+                        if (d.counter > 0 && linkedNodes.length > 0) {
+                            for (var n = 0; n < linkedNodes.length; n++) {
+                                var ln = linkedNodes[n];
+                                unreadNodeIds[ln.nodeId] = {
+                                    count: d.counter,
+                                    dialogId: d.dialogId,
+                                    title: d.title,
+                                    preview: (d.lastMessage && d.lastMessage.text) || ''
+                                };
+                            }
+                        }
+                        if (command.includeDialogs !== false) {
+                            dialogsOut.push(Object.assign({}, d, { linkedNodes: linkedNodes }));
+                        }
+                    }
+
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        ok: true,
+                        authenticated: true,
+                        auth: recent.auth,
+                        unreadTotal: recent.unreadTotal,
+                        unreadDialogsCount: recent.unreadDialogsCount,
+                        dialogs: dialogsOut,
+                        unreadNodeIds: unreadNodeIds,
+                        nodeToB24: bindings.nodeToB24
+                    });
+                } catch (err) {
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        ok: false,
+                        authRequired: Boolean(err && err.authRequired),
+                        auth: getUserChatAuthStatus(client.user._id),
+                        error: err && err.message ? err.message : 'Не удалось загрузить список чатов Битрикс24'
+                    });
+                }
+            })();
         }
     };
 
@@ -2199,13 +2514,16 @@ function createPlugin(parent) {
         resolveRestEndpoint: resolveRestEndpoint,
         registerRoutes: registerRoutes,
         completeOAuthCallback: completeOAuthCallback,
+        fetchRecentDialogsForUser: fetchRecentDialogsForUser,
+        markDialogReadForUser: markDialogReadForUser,
+        resolveClientNodeBindings: resolveClientNodeBindings,
         oauthStates: oauthStates,
         refreshCache: refreshCache,
         getCacheState: function () { return cache; }
     };
 
     // Browser-serialized hooks (MUST NOT reference Node closure variables)
-    obj.exports = ['onWebUIStartupEnd', 'onDeviceRefreshEnd', 'onContactsResult', 'onSettingsResult', 'onChatResult', 'openSettings'];
+    obj.exports = ['onWebUIStartupEnd', 'onDeviceRefreshEnd', 'goPageStart', 'onContactsResult', 'onSettingsResult', 'onChatResult', 'openSettings'];
 
     obj.onWebUIStartupEnd = function () {
         if (window.B24ContactsPlugin) {
@@ -2218,6 +2536,9 @@ function createPlugin(parent) {
         var STYLE_ID = 'b24-contacts-style';
         var ACCOUNT_LINK_ID = 'plugin_b24contactsSettings';
         var MODAL_ID = 'b24c-settings-overlay';
+        var LEFTBAR_TAB_ID = 'b24c-leftbar-tab';
+        var LEFTBAR_BADGE_ID = 'b24c-leftbar-badge';
+        var CHATS_PAGE_ID = 'b24c-chats-page';
         var FRONTEND_CACHE_TTL_MS = 5 * 60 * 1000;
         var WS_TIMEOUT_MS = 8000;
 
@@ -2228,7 +2549,31 @@ function createPlugin(parent) {
         var requestSeq = 0;
         var configRevision = 0;
         var chatPollTimer = null;
+        var unreadPollTimer = null;
         var activeChatContext = null;
+
+        var overviewState = {
+            authenticated: false,
+            auth: null,
+            unreadTotal: 0,
+            unreadDialogsCount: 0,
+            dialogs: [],
+            unreadNodeIds: {},
+            nodeToB24: {},
+            lastFetchedAt: 0,
+            inFlight: false
+        };
+
+        var chatsPageState = {
+            open: false,
+            selectedDialogId: '',
+            filterMode: 'all',
+            searchQuery: '',
+            messages: [],
+            loadingThread: false,
+            threadError: '',
+            renderedShell: false
+        };
 
         if (typeof window.addEventListener === 'function' && !window._b24cOAuthListenerBound) {
             window._b24cOAuthListenerBound = true;
@@ -2240,6 +2585,9 @@ function createPlugin(parent) {
                     configRevision++;
                     if (window.currentNode) {
                         loadContactsForNode(window.currentNode, true);
+                    }
+                    if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.refreshOverview === 'function') {
+                        window.B24ContactsPlugin.refreshOverview(true);
                     }
                 } catch (e) {}
             });
@@ -2336,6 +2684,60 @@ function createPlugin(parent) {
                 '#' + MODAL_ID + ' button:not(.b24c-m-primary):hover{background:#edf4ff}',
                 '#' + MODAL_ID + ' .b24c-m-primary{background:#1769f5;color:#fff;border:1px solid #1769f5;border-radius:3px;padding:6px 12px;cursor:pointer;font:13px Arial,sans-serif}',
                 '#' + MODAL_ID + ' .b24c-m-primary:hover{background:#0758d8}',
+                '#' + LEFTBAR_TAB_ID + '{position:relative;display:flex;align-items:center;justify-content:center;width:100%;height:44px;cursor:pointer;color:#fff;transition:background .15s,color .15s;box-sizing:border-box;user-select:none}',
+                '#' + LEFTBAR_TAB_ID + ':hover{background:rgba(255,255,255,0.14)}',
+                '#' + LEFTBAR_TAB_ID + '.active{background:#fff;color:#14498a}',
+                '#' + LEFTBAR_TAB_ID + ' svg{width:23px;height:23px;display:block}',
+                '#' + LEFTBAR_BADGE_ID + '{position:absolute;top:5px;right:6px;min-width:16px;height:16px;padding:0 4px;border-radius:9px;background:#ef4444;color:#fff;font:700 10px/16px Arial,sans-serif;text-align:center;box-shadow:0 0 0 1.5px #14498a;display:none}',
+                '#' + LEFTBAR_BADGE_ID + '.visible{display:inline-block}',
+                '.b24c-dev-unread{background:linear-gradient(90deg,rgba(254,243,199,0.72),rgba(239,246,255,0.65)) !important;box-shadow:inset 3px 0 0 #ef4444 !important}',
+                '.b24c-dev-icon-unread{position:relative !important;outline:2px solid #ef4444 !important;outline-offset:1px;border-radius:5px !important;box-shadow:0 0 8px rgba(239,68,68,0.55) !important;animation:b24c-pulse 1.8s ease-in-out infinite}',
+                '.b24c-dev-msg-badge{display:inline-flex;align-items:center;gap:3px;margin-left:6px;padding:1px 6px;border-radius:10px;background:#ef4444;color:#fff;font:700 11px/15px Arial,sans-serif;cursor:pointer;vertical-align:middle;box-shadow:0 1px 3px rgba(0,0,0,0.2);text-decoration:none}',
+                '.b24c-dev-msg-badge:hover{background:#dc2626}',
+                '#' + CHATS_PAGE_ID + '{display:none;padding:10px 14px;box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;color:#0f172a;height:calc(100vh - 86px);min-height:480px;flex-direction:column;gap:10px}',
+                '#' + CHATS_PAGE_ID + '.visible{display:flex}',
+                '#' + CHATS_PAGE_ID + ' *{box-sizing:border-box}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:#fff;border:1px solid #d5dce6;border-radius:6px;flex-shrink:0;flex-wrap:wrap}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-title{margin:0;font-size:17px;font-weight:700;display:flex;align-items:center;gap:8px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-user{display:flex;align-items:center;gap:10px;font-size:12px;color:#475569}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-btn{background:#fff;color:#1e3a8a;border:1px solid #cbd5e1;border-radius:4px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:4px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-btn:hover{background:#eff6ff;border-color:#93c5fd}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-login{max-width:460px;background:#fff;border:1px solid #d5dce6;border-radius:6px;padding:18px;display:flex;flex-direction:column;gap:10px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-layout{flex:1;min-height:0;display:grid;grid-template-columns:320px 1fr;gap:10px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-sidebar{background:#fff;border:1px solid #d5dce6;border-radius:6px;display:flex;flex-direction:column;min-height:0;overflow:hidden}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-controls{padding:8px;border-bottom:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-search{width:100%;height:30px;padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font:12px Arial,sans-serif}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-tabs{display:flex;gap:6px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-tab{flex:1;padding:4px 8px;font-size:11px;font-weight:600;border:1px solid #cbd5e1;border-radius:4px;background:#f8fafc;color:#475569;cursor:pointer}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-tab.active{background:#1769f5;color:#fff;border-color:#1769f5}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-list{flex:1;min-height:0;overflow-y:auto}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-item{padding:9px 10px;border-bottom:1px solid #f1f5f9;cursor:pointer;display:flex;flex-direction:column;gap:3px;transition:background .12s}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-item:hover{background:#f8fafc}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-item.selected{background:#eff6ff;box-shadow:inset 3px 0 0 #1769f5}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-item.unread{background:#fffbeb}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-top{display:flex;align-items:center;justify-content:space-between;gap:6px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-name{font-size:13px;font-weight:700;color:#0f172a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-time{font-size:10px;color:#64748b;flex-shrink:0}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-bottom{display:flex;align-items:center;justify-content:space-between;gap:6px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-preview{font-size:12px;color:#475569;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-badge{min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#ef4444;color:#fff;font:700 11px/18px Arial,sans-serif;text-align:center;flex-shrink:0}',
+                '#' + CHATS_PAGE_ID + ' .b24c-dialog-tags{display:flex;flex-wrap:wrap;gap:4px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:#e0f2fe;color:#0369a1;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+                '#' + CHATS_PAGE_ID + ' .b24c-tag.group{background:#f1f5f9;color:#475569}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-main{background:#fff;border:1px solid #d5dce6;border-radius:6px;display:flex;flex-direction:column;min-height:0;overflow:hidden}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-head{padding:10px 14px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:#f8fafc}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-title{font-size:15px;font-weight:700;color:#0f172a}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-sub{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px;font-size:12px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-msgs{flex:1;min-height:0;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:6px;background:#fafcff}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-msgs .b24c-chat-msg{max-width:78%;padding:7px 10px;border-radius:6px;font-size:13px;align-self:flex-start;background:#eef2f7}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-msgs .b24c-chat-msg.mine{align-self:flex-end;background:#dbeafe}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-form{padding:10px 12px;border-top:1px solid #e2e8f0;display:flex;gap:8px;align-items:flex-end;background:#fff}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-input{flex:1;min-height:38px;max-height:110px;padding:7px 10px;border:1px solid #cbd5e1;border-radius:4px;font:13px Arial,sans-serif;resize:vertical}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-send{height:38px;padding:0 16px;border:1px solid #1769f5;border-radius:4px;background:#1769f5;color:#fff;font-size:13px;font-weight:600;cursor:pointer}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-send:disabled{opacity:0.55;cursor:default}',
+                '#' + CHATS_PAGE_ID + ' .b24c-empty-thread{margin:auto;text-align:center;color:#64748b;font-size:13px;padding:24px}',
+                '@media(max-width:860px){#' + CHATS_PAGE_ID + ' .b24c-p-layout{grid-template-columns:1fr;grid-template-rows:240px 1fr}}',
+                '@keyframes b24c-pulse{0%,100%{box-shadow:0 0 6px rgba(239,68,68,0.45)}50%{box-shadow:0 0 12px rgba(239,68,68,0.9)}}',
                 '@keyframes b24c-spin{to{transform:rotate(360deg)}}',
                 '@media(max-width:600px){#' + MODAL_ID + ' .b24c-m-grid{grid-template-columns:1fr}}'
             ].join('\n');
@@ -2583,6 +2985,911 @@ function createPlugin(parent) {
             }
         }
 
+        function renderBitrixLoginBlock(container, authObj, errMsg, onSuccess, onRenderError) {
+            var currentAuth = authObj || { authenticated: false, oauthConfigured: false };
+
+            var hint = document.createElement('div');
+            hint.className = 'b24c-muted';
+            hint.textContent = 'Войдите под своим аккаунтом Битрикс24, чтобы видеть переписку, непрочитанные чаты и отвечать от своего имени.';
+            container.appendChild(hint);
+
+            if (errMsg) {
+                var errDiv = document.createElement('div');
+                errDiv.className = 'b24c-error';
+                errDiv.textContent = errMsg;
+                container.appendChild(errDiv);
+            }
+
+            if (currentAuth && currentAuth.oauthConfigured) {
+                var oauthBtn = document.createElement('button');
+                oauthBtn.type = 'button';
+                oauthBtn.className = 'b24c-inline-btn';
+                oauthBtn.textContent = 'Войти через Битрикс24';
+                oauthBtn.onclick = function () {
+                    oauthBtn.disabled = true;
+                    sendPluginAction('startOAuth', { origin: window.location.origin }, pendingChat)
+                        .then(function (res) {
+                            oauthBtn.disabled = false;
+                            if (!res || !res.ok || !res.authorizeUrl) {
+                                onRenderError((res && res.error) || 'Не удалось начать вход');
+                                return;
+                            }
+                            var popup = window.open(res.authorizeUrl, 'b24contacts_oauth', 'width=540,height=660');
+                            if (!popup) {
+                                onRenderError('Браузер заблокировал всплывающее окно. Разрешите pop-up для этого сайта.');
+                                return;
+                            }
+                            var checkTimer = setInterval(function () {
+                                if (popup.closed) {
+                                    clearInterval(checkTimer);
+                                    sendPluginAction('getChatAuth', {}, pendingChat).then(function (authRes) {
+                                        if (authRes && authRes.auth && authRes.auth.authenticated) {
+                                            responseCache.clear();
+                                            onSuccess(authRes.auth);
+                                        }
+                                    }).catch(function () {});
+                                }
+                            }, 500);
+                        })
+                        .catch(function (err) {
+                            oauthBtn.disabled = false;
+                            onRenderError(err && err.message);
+                        });
+                };
+                container.appendChild(oauthBtn);
+            } else {
+                var noOAuthNote = document.createElement('div');
+                noOAuthNote.className = 'b24c-muted';
+                noOAuthNote.textContent = 'OAuth-вход не настроен администратором — можно войти по своему личному вебхуку Битрикс24 (права: user, im):';
+                container.appendChild(noOAuthNote);
+            }
+
+            var altWrap = document.createElement('div');
+            altWrap.className = 'b24c-chat-alt';
+            var altToggle = document.createElement('button');
+            altToggle.type = 'button';
+            altToggle.className = 'b24c-chat-btn-link';
+            altToggle.style.textAlign = 'left';
+            altToggle.style.padding = '0';
+            altToggle.textContent = (currentAuth && currentAuth.oauthConfigured)
+                ? 'Или войти по личному вебхуку'
+                : 'Указать личный вебхук';
+
+            var hookForm = document.createElement('form');
+            hookForm.className = 'b24c-chat-form';
+            hookForm.style.display = (currentAuth && currentAuth.oauthConfigured) ? 'none' : 'flex';
+            var hookInput = document.createElement('input');
+            hookInput.type = 'password';
+            hookInput.className = 'b24c-chat-input';
+            hookInput.placeholder = 'https://.../rest/ID/токен/';
+            hookInput.autocomplete = 'off';
+            stopKeyPropagation(hookInput);
+            var hookSave = document.createElement('button');
+            hookSave.type = 'submit';
+            hookSave.className = 'b24c-chat-send';
+            hookSave.textContent = 'Войти';
+            hookForm.appendChild(hookInput);
+            hookForm.appendChild(hookSave);
+
+            altToggle.onclick = function () {
+                hookForm.style.display = hookForm.style.display === 'none' ? 'flex' : 'none';
+            };
+            hookForm.onsubmit = function (e) {
+                e.preventDefault();
+                var val = hookInput.value.trim();
+                if (!val) return;
+                hookSave.disabled = true;
+                sendPluginAction('savePersonalWebhook', { webhookUrl: val }, pendingChat)
+                    .then(function (res) {
+                        hookSave.disabled = false;
+                        if (!res || !res.ok || !res.auth || !res.auth.authenticated) {
+                            onRenderError((res && res.error) || 'Не удалось проверить личный вебхук');
+                            return;
+                        }
+                        responseCache.clear();
+                        onSuccess(res.auth);
+                    })
+                    .catch(function (err) {
+                        hookSave.disabled = false;
+                        onRenderError(err && err.message);
+                    });
+            };
+
+            altWrap.appendChild(altToggle);
+            altWrap.appendChild(hookForm);
+            container.appendChild(altWrap);
+        }
+
+        function renderMessagesInto(msgsBox, messages, emptyText) {
+            msgsBox.replaceChildren();
+            if (!Array.isArray(messages) || messages.length === 0) {
+                var empty = document.createElement('div');
+                empty.className = 'b24c-muted';
+                empty.textContent = emptyText || 'Сообщений пока нет — напишите первое';
+                msgsBox.appendChild(empty);
+                return;
+            }
+            for (var i = 0; i < messages.length; i++) {
+                var m = messages[i];
+                var item = document.createElement('div');
+                item.className = 'b24c-chat-msg' + (m.isMine ? ' mine' : '');
+
+                var meta = document.createElement('div');
+                meta.className = 'b24c-chat-meta';
+                var author = document.createElement('span');
+                author.textContent = m.isMine ? 'Вы' : (m.authorName || 'Сотрудник');
+                var tm = document.createElement('span');
+                tm.textContent = formatMsgTime(m.date);
+                meta.appendChild(author);
+                meta.appendChild(tm);
+
+                var txt = document.createElement('div');
+                txt.className = 'b24c-chat-text';
+                txt.textContent = m.text || '';
+
+                item.appendChild(meta);
+                item.appendChild(txt);
+                msgsBox.appendChild(item);
+            }
+            msgsBox.scrollTop = msgsBox.scrollHeight;
+        }
+
+        function collectVisibleNodes() {
+            var arr = [];
+            if (typeof nodes !== 'undefined' && Array.isArray(nodes)) {
+                for (var i = 0; i < nodes.length; i++) {
+                    var n = nodes[i];
+                    if (n && n._id && n.v !== false) {
+                        arr.push({ id: String(n._id), name: typeof n.name === 'string' ? n.name : '' });
+                    }
+                }
+            }
+            return arr;
+        }
+
+        function updateLeftbarBadge() {
+            var badge = document.getElementById(LEFTBAR_BADGE_ID);
+            if (!badge) return;
+            var total = Number(overviewState.unreadTotal) || 0;
+            if (total > 0) {
+                badge.textContent = total > 99 ? '99+' : String(total);
+                badge.classList.add('visible');
+            } else {
+                badge.textContent = '';
+                badge.classList.remove('visible');
+            }
+        }
+
+        function findDeviceRowFromCheckbox(chk, root) {
+            var cur = chk;
+            var steps = 0;
+            while (cur && cur.parentElement && cur.parentElement !== root && steps < 5) {
+                var parent = cur.parentElement;
+                if (typeof parent.querySelectorAll === 'function') {
+                    var count = parent.querySelectorAll('.DeviceCheckbox, input[value^="devid_"], input[id^="devid_"]').length;
+                    if (count > 1) break;
+                }
+                cur = parent;
+                steps++;
+                if (cur.tagName === 'TR') break;
+            }
+            return cur;
+        }
+
+        function highlightUnreadDevices() {
+            var root = document.getElementById('xdevices') || document.getElementById('p1');
+            if (!root || typeof root.querySelectorAll !== 'function') return;
+
+            var checkboxes = root.querySelectorAll('.DeviceCheckbox, input[value^="devid_"], input[id^="devid_"]');
+            var unreadMap = overviewState.unreadNodeIds || {};
+
+            for (var i = 0; i < checkboxes.length; i++) {
+                var chk = checkboxes[i];
+                var raw = (chk.value && chk.value.indexOf('devid_') === 0)
+                    ? chk.value
+                    : (chk.id && chk.id.indexOf('devid_') === 0 ? chk.id : '');
+                if (!raw) continue;
+                var nodeId = raw.slice(6);
+                var rowEl = findDeviceRowFromCheckbox(chk, root);
+                if (!rowEl || rowEl === root) continue;
+
+                var iconEl = typeof rowEl.querySelector === 'function'
+                    ? rowEl.querySelector('.i32, .i24, .i28, .i16, [class*="Icon"], [class*="icon"]:not(.b24c-icon), img, svg')
+                    : null;
+                var oldBadge = typeof rowEl.querySelector === 'function'
+                    ? rowEl.querySelector('.b24c-dev-msg-badge')
+                    : null;
+                var info = unreadMap[nodeId];
+
+                if (info && info.count > 0) {
+                    rowEl.classList.add('b24c-dev-unread');
+                    if (iconEl) iconEl.classList.add('b24c-dev-icon-unread');
+                    var tip = 'Новое сообщение в Битрикс24' + (info.title ? ' (' + info.title + ')' : '') + (info.preview ? ': ' + info.preview : '');
+                    if (!oldBadge) {
+                        oldBadge = document.createElement('span');
+                        oldBadge.className = 'b24c-dev-msg-badge';
+                        (function (dlgId) {
+                            oldBadge.onclick = function (e) {
+                                if (e && e.stopPropagation) e.stopPropagation();
+                                if (e && e.preventDefault) e.preventDefault();
+                                openChatsPage(dlgId);
+                            };
+                        })(info.dialogId);
+                        if (iconEl && iconEl.parentElement && iconEl.parentElement !== rowEl) {
+                            iconEl.parentElement.appendChild(oldBadge);
+                        } else {
+                            rowEl.appendChild(oldBadge);
+                        }
+                    }
+                    oldBadge.textContent = '💬 ' + info.count;
+                    oldBadge.title = tip;
+                } else {
+                    rowEl.classList.remove('b24c-dev-unread');
+                    if (iconEl) iconEl.classList.remove('b24c-dev-icon-unread');
+                    if (oldBadge) {
+                        if (typeof oldBadge.remove === 'function') oldBadge.remove();
+                        else if (oldBadge.parentNode && typeof oldBadge.parentNode.removeChild === 'function') oldBadge.parentNode.removeChild(oldBadge);
+                    }
+                }
+            }
+        }
+
+        function clearDialogUnreadLocal(dialogId) {
+            if (!dialogId) return;
+            var changed = false;
+            var dialogs = overviewState.dialogs || [];
+            var total = 0;
+            var dCount = 0;
+            for (var i = 0; i < dialogs.length; i++) {
+                var d = dialogs[i];
+                if (String(d.dialogId) === String(dialogId) && (d.counter > 0 || d.unread)) {
+                    d.counter = 0;
+                    d.unread = false;
+                    changed = true;
+                }
+                if (d.counter > 0) {
+                    total += d.counter;
+                    dCount++;
+                }
+            }
+            var unreadNodes = overviewState.unreadNodeIds || {};
+            var nKeys = Object.keys(unreadNodes);
+            for (var k = 0; k < nKeys.length; k++) {
+                if (String(unreadNodes[nKeys[k]].dialogId) === String(dialogId)) {
+                    delete unreadNodes[nKeys[k]];
+                    changed = true;
+                }
+            }
+            if (changed) {
+                overviewState.unreadTotal = dialogs.length ? total : Math.max(0, (overviewState.unreadTotal || 0) - 1);
+                overviewState.unreadDialogsCount = dialogs.length ? dCount : Math.max(0, (overviewState.unreadDialogsCount || 0) - 1);
+                updateLeftbarBadge();
+                highlightUnreadDevices();
+                if (chatsPageState.open) renderChatsPageBody();
+            }
+        }
+
+        function ensureLeftbarTab() {
+            var bar = document.getElementById('page_leftbar');
+            if (!bar) return null;
+            var btn = document.getElementById(LEFTBAR_TAB_ID);
+            if (!btn) {
+                btn = document.createElement('div');
+                btn.id = LEFTBAR_TAB_ID;
+                btn.setAttribute('role', 'button');
+                btn.setAttribute('tabindex', '0');
+                btn.title = 'Чаты Битрикс24';
+                var icon = createSvgIcon('chat');
+                icon.setAttribute('class', '');
+                btn.appendChild(icon);
+
+                var badge = document.createElement('span');
+                badge.id = LEFTBAR_BADGE_ID;
+                btn.appendChild(badge);
+
+                btn.onclick = function () { openChatsPage(); };
+                btn.onkeydown = function (e) {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        openChatsPage();
+                    }
+                };
+
+                var anchor = null;
+                var ch = bar.children || [];
+                if (ch.length > 0) {
+                    var last = ch[ch.length - 1];
+                    if (last && typeof last.getAttribute === 'function' && !last.getAttribute('onclick') && (!last.children || last.children.length === 0)) {
+                        anchor = last;
+                    }
+                }
+                if (anchor) bar.insertBefore(btn, anchor);
+                else bar.appendChild(btn);
+            }
+            if (chatsPageState.open) btn.classList.add('active');
+            else btn.classList.remove('active');
+            updateLeftbarBadge();
+            return btn;
+        }
+
+        function ensureChatsPageElement() {
+            injectStyles();
+            var col = document.getElementById('column_l');
+            if (!col) return null;
+            var page = document.getElementById(CHATS_PAGE_ID);
+            if (!page) {
+                page = document.createElement('div');
+                page.id = CHATS_PAGE_ID;
+                col.appendChild(page);
+            }
+            return page;
+        }
+
+        function closeChatsPage() {
+            chatsPageState.open = false;
+            var page = document.getElementById(CHATS_PAGE_ID);
+            if (page) page.classList.remove('visible');
+            var btn = document.getElementById(LEFTBAR_TAB_ID);
+            if (btn) btn.classList.remove('active');
+            var bar = document.getElementById('page_leftbar');
+            if (bar) {
+                var items = bar.children || [];
+                for (var i = 0; i < items.length; i++) {
+                    var item = items[i];
+                    if (item === btn || !item.dataset) continue;
+                    if (item.dataset.b24cHadInlineBg) {
+                        item.style.backgroundColor = '';
+                        item.style.color = '';
+                        delete item.dataset.b24cHadInlineBg;
+                    }
+                }
+            }
+        }
+
+        function loadChatsPageThread(dialogId, silent) {
+            if (!dialogId) return;
+            chatsPageState.loadingThread = !silent;
+            chatsPageState.threadError = '';
+            if (!silent) renderChatsPageThreadPane();
+
+            sendPluginAction('getChatMessages', { dialogId: dialogId, limit: 30, markRead: true }, pendingChat)
+                .then(function (res) {
+                    if (chatsPageState.selectedDialogId !== dialogId) return;
+                    chatsPageState.loadingThread = false;
+                    if (res && res.auth) overviewState.auth = res.auth;
+                    if (res && res.authRequired) {
+                        overviewState.authenticated = false;
+                        renderChatsPageBody();
+                        return;
+                    }
+                    if (!res || !res.ok) {
+                        chatsPageState.threadError = (res && res.error) || 'Не удалось загрузить сообщения';
+                        renderChatsPageThreadPane();
+                        return;
+                    }
+                    chatsPageState.messages = Array.isArray(res.messages) ? res.messages : [];
+                    clearDialogUnreadLocal(dialogId);
+                    renderChatsPageThreadPane();
+                })
+                .catch(function (err) {
+                    if (chatsPageState.selectedDialogId !== dialogId) return;
+                    chatsPageState.loadingThread = false;
+                    chatsPageState.threadError = err && err.message ? err.message : 'Ошибка загрузки переписки';
+                    renderChatsPageThreadPane();
+                });
+        }
+
+        function selectDialogOnPage(dialogId) {
+            chatsPageState.selectedDialogId = String(dialogId || '');
+            chatsPageState.messages = [];
+            clearDialogUnreadLocal(chatsPageState.selectedDialogId);
+            renderChatsPageSidebarList();
+            loadChatsPageThread(chatsPageState.selectedDialogId, false);
+        }
+
+        function getSelectedDialogObj() {
+            var id = chatsPageState.selectedDialogId;
+            if (!id) return null;
+            var dialogs = overviewState.dialogs || [];
+            for (var i = 0; i < dialogs.length; i++) {
+                if (String(dialogs[i].dialogId) === String(id)) return dialogs[i];
+            }
+            return null;
+        }
+
+        function renderChatsPageSidebarList() {
+            var page = document.getElementById(CHATS_PAGE_ID);
+            if (!page) return;
+            var listEl = page.querySelector('.b24c-dialog-list');
+            var tabs = page.querySelectorAll('.b24c-p-tab');
+            if (!listEl) return;
+
+            var allDialogs = overviewState.dialogs || [];
+            var unreadCount = 0;
+            for (var c = 0; c < allDialogs.length; c++) {
+                if (allDialogs[c].counter > 0 || allDialogs[c].unread) unreadCount++;
+            }
+            if (tabs.length >= 2) {
+                tabs[0].textContent = 'Все (' + allDialogs.length + ')';
+                tabs[1].textContent = 'Непрочитанные (' + unreadCount + ')';
+                tabs[0].classList.toggle('active', chatsPageState.filterMode !== 'unread');
+                tabs[1].classList.toggle('active', chatsPageState.filterMode === 'unread');
+            }
+
+            var q = (chatsPageState.searchQuery || '').trim().toLowerCase().replace(/ё/g, 'е');
+            listEl.replaceChildren();
+            var shown = 0;
+
+            for (var i = 0; i < allDialogs.length; i++) {
+                var d = allDialogs[i];
+                if (chatsPageState.filterMode === 'unread' && !(d.counter > 0 || d.unread)) continue;
+                var nodesText = Array.isArray(d.linkedNodes)
+                    ? d.linkedNodes.map(function (ln) { return ln.nodeName || ln.nodeId; }).join(' ')
+                    : '';
+                if (q) {
+                    var hay = (d.title + ' ' + nodesText + ' ' + ((d.lastMessage && d.lastMessage.text) || '')).toLowerCase().replace(/ё/g, 'е');
+                    if (hay.indexOf(q) === -1) continue;
+                }
+                shown++;
+
+                var item = document.createElement('div');
+                item.className = 'b24c-dialog-item'
+                    + (String(d.dialogId) === String(chatsPageState.selectedDialogId) ? ' selected' : '')
+                    + (d.counter > 0 ? ' unread' : '');
+                (function (dlgId) {
+                    item.onclick = function () { selectDialogOnPage(dlgId); };
+                })(d.dialogId);
+
+                var top = document.createElement('div');
+                top.className = 'b24c-dialog-top';
+                var nameSpan = document.createElement('span');
+                nameSpan.className = 'b24c-dialog-name';
+                nameSpan.textContent = d.title || ('Диалог ' + d.dialogId);
+                var timeSpan = document.createElement('span');
+                timeSpan.className = 'b24c-dialog-time';
+                timeSpan.textContent = formatMsgTime(d.lastMessage && d.lastMessage.date);
+                top.appendChild(nameSpan);
+                top.appendChild(timeSpan);
+                item.appendChild(top);
+
+                if ((Array.isArray(d.linkedNodes) && d.linkedNodes.length > 0) || d.type !== 'user') {
+                    var tags = document.createElement('div');
+                    tags.className = 'b24c-dialog-tags';
+                    if (d.type !== 'user') {
+                        var gTag = document.createElement('span');
+                        gTag.className = 'b24c-tag group';
+                        gTag.textContent = 'Групповой чат';
+                        tags.appendChild(gTag);
+                    }
+                    if (Array.isArray(d.linkedNodes) && d.linkedNodes.length > 0) {
+                        var pcTag = document.createElement('span');
+                        pcTag.className = 'b24c-tag';
+                        pcTag.textContent = d.linkedNodes.length === 1
+                            ? ('ПК: ' + (d.linkedNodes[0].nodeName || d.linkedNodes[0].nodeId))
+                            : ('ПК: ' + d.linkedNodes.length + ' шт.');
+                        tags.appendChild(pcTag);
+                    }
+                    item.appendChild(tags);
+                }
+
+                var bottom = document.createElement('div');
+                bottom.className = 'b24c-dialog-bottom';
+                var prev = document.createElement('span');
+                prev.className = 'b24c-dialog-preview';
+                prev.textContent = (d.lastMessage && d.lastMessage.text) || 'Нет сообщений';
+                bottom.appendChild(prev);
+                if (d.counter > 0) {
+                    var cnt = document.createElement('span');
+                    cnt.className = 'b24c-dialog-badge';
+                    cnt.textContent = d.counter > 99 ? '99+' : String(d.counter);
+                    bottom.appendChild(cnt);
+                }
+                item.appendChild(bottom);
+
+                listEl.appendChild(item);
+            }
+
+            if (shown === 0) {
+                var empty = document.createElement('div');
+                empty.className = 'b24c-muted';
+                empty.style.padding = '16px';
+                empty.textContent = allDialogs.length === 0
+                    ? 'Список диалогов пока пуст'
+                    : 'Подходящие чаты не найдены';
+                listEl.appendChild(empty);
+            }
+        }
+
+        function renderChatsPageThreadPane() {
+            var page = document.getElementById(CHATS_PAGE_ID);
+            if (!page) return;
+            var mainPane = page.querySelector('.b24c-p-main');
+            if (!mainPane) return;
+
+            var dlg = getSelectedDialogObj();
+            mainPane.replaceChildren();
+
+            if (!dlg && !chatsPageState.selectedDialogId) {
+                var placeholder = document.createElement('div');
+                placeholder.className = 'b24c-empty-thread';
+                placeholder.textContent = 'Выберите чат слева, чтобы прочитать сообщения и ответить.';
+                mainPane.appendChild(placeholder);
+                return;
+            }
+
+            var activeDialogId = dlg ? dlg.dialogId : chatsPageState.selectedDialogId;
+            var head = document.createElement('div');
+            head.className = 'b24c-thread-head';
+            var headLeft = document.createElement('div');
+            var title = document.createElement('div');
+            title.className = 'b24c-thread-title';
+            title.textContent = (dlg && dlg.title) || ('Диалог #' + activeDialogId);
+            headLeft.appendChild(title);
+
+            var sub = document.createElement('div');
+            sub.className = 'b24c-thread-sub';
+            if (dlg && Array.isArray(dlg.phones) && dlg.phones.length > 0) {
+                dlg.phones.forEach(function (ph) {
+                    if (ph && isSafeTelHref(ph.href)) {
+                        var telA = document.createElement('a');
+                        telA.className = 'b24c-link';
+                        telA.href = ph.href;
+                        telA.textContent = ph.display;
+                        sub.appendChild(telA);
+                    }
+                });
+            }
+            if (dlg && Array.isArray(dlg.linkedNodes) && dlg.linkedNodes.length > 0) {
+                dlg.linkedNodes.forEach(function (ln) {
+                    var devBtn = document.createElement('button');
+                    devBtn.type = 'button';
+                    devBtn.className = 'b24c-p-btn';
+                    devBtn.textContent = '🖥 ' + (ln.nodeName || ln.nodeId);
+                    devBtn.title = 'Открыть компьютер в MeshCentral';
+                    devBtn.onclick = function () {
+                        closeChatsPage();
+                        if (typeof gotoDevice === 'function') gotoDevice(ln.nodeId, 10);
+                    };
+                    sub.appendChild(devBtn);
+                });
+            }
+            if (sub.children.length > 0) headLeft.appendChild(sub);
+
+            var headRight = document.createElement('div');
+            headRight.style.display = 'flex';
+            headRight.style.gap = '6px';
+            if (dlg && isSafeHttpUrl(dlg.chatUrl)) {
+                var openB24 = document.createElement('a');
+                openB24.className = 'b24c-p-btn';
+                openB24.href = dlg.chatUrl;
+                openB24.target = '_blank';
+                openB24.rel = 'noopener noreferrer';
+                openB24.textContent = 'Открыть в Битрикс24';
+                headRight.appendChild(openB24);
+            }
+            var reloadBtn = document.createElement('button');
+            reloadBtn.type = 'button';
+            reloadBtn.className = 'b24c-p-btn';
+            reloadBtn.textContent = '↻';
+            reloadBtn.title = 'Обновить переписку';
+            reloadBtn.onclick = function () { loadChatsPageThread(activeDialogId, false); };
+            headRight.appendChild(reloadBtn);
+
+            head.appendChild(headLeft);
+            head.appendChild(headRight);
+
+            var msgsBox = document.createElement('div');
+            msgsBox.className = 'b24c-thread-msgs';
+            if (chatsPageState.loadingThread && chatsPageState.messages.length === 0) {
+                var loadEl = document.createElement('div');
+                loadEl.className = 'b24c-muted';
+                loadEl.textContent = 'Загрузка сообщений...';
+                msgsBox.appendChild(loadEl);
+            } else if (chatsPageState.threadError) {
+                var errEl = document.createElement('div');
+                errEl.className = 'b24c-error';
+                errEl.textContent = chatsPageState.threadError;
+                msgsBox.appendChild(errEl);
+            } else {
+                renderMessagesInto(msgsBox, chatsPageState.messages, 'Сообщений пока нет — напишите первое');
+            }
+
+            var sendForm = document.createElement('form');
+            sendForm.className = 'b24c-thread-form';
+            var textarea = document.createElement('textarea');
+            textarea.className = 'b24c-thread-input';
+            textarea.placeholder = 'Напишите сообщение (Enter — отправить, Shift+Enter — перенос строки)...';
+            textarea.maxLength = 4000;
+            stopKeyPropagation(textarea);
+            textarea.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    if (typeof sendForm.requestSubmit === 'function') sendForm.requestSubmit();
+                    else sendForm.dispatchEvent(new Event('submit', { cancelable: true }));
+                }
+            });
+            var sendBtn = document.createElement('button');
+            sendBtn.type = 'submit';
+            sendBtn.className = 'b24c-thread-send';
+            sendBtn.textContent = 'Отправить';
+
+            sendForm.onsubmit = function (e) {
+                e.preventDefault();
+                var text = textarea.value.trim();
+                if (!text) return;
+                sendBtn.disabled = true;
+                textarea.disabled = true;
+                sendPluginAction('sendChatMessage', { dialogId: activeDialogId, message: text, limit: 30 }, pendingChat)
+                    .then(function (res) {
+                        sendBtn.disabled = false;
+                        textarea.disabled = false;
+                        if (res && res.authRequired) {
+                            overviewState.authenticated = false;
+                            renderChatsPageBody();
+                            return;
+                        }
+                        if (!res || !res.ok) {
+                            chatsPageState.threadError = (res && res.error) || 'Не удалось отправить сообщение';
+                            renderChatsPageThreadPane();
+                            return;
+                        }
+                        textarea.value = '';
+                        chatsPageState.messages = Array.isArray(res.messages) ? res.messages : [];
+                        clearDialogUnreadLocal(activeDialogId);
+                        renderMessagesInto(msgsBox, chatsPageState.messages);
+                        textarea.focus();
+                        refreshChatOverview(true);
+                    })
+                    .catch(function (err) {
+                        sendBtn.disabled = false;
+                        textarea.disabled = false;
+                        chatsPageState.threadError = err && err.message ? err.message : 'Ошибка отправки';
+                        renderChatsPageThreadPane();
+                    });
+            };
+
+            sendForm.appendChild(textarea);
+            sendForm.appendChild(sendBtn);
+
+            mainPane.appendChild(head);
+            mainPane.appendChild(msgsBox);
+            mainPane.appendChild(sendForm);
+        }
+
+        function renderChatsPageBody() {
+            var page = ensureChatsPageElement();
+            if (!page) return;
+            page.replaceChildren();
+
+            var header = document.createElement('div');
+            header.className = 'b24c-p-head';
+            var title = document.createElement('h2');
+            title.className = 'b24c-p-title';
+            title.textContent = 'Чаты Битрикс24';
+
+            var userBar = document.createElement('div');
+            userBar.className = 'b24c-p-user';
+            if (overviewState.authenticated && overviewState.auth) {
+                var who = document.createElement('span');
+                who.textContent = overviewState.auth.b24UserName || 'Битрикс24';
+                userBar.appendChild(who);
+
+                var syncBtn = document.createElement('button');
+                syncBtn.type = 'button';
+                syncBtn.className = 'b24c-p-btn';
+                syncBtn.textContent = '↻ Обновить';
+                syncBtn.onclick = function () {
+                    refreshChatOverview(true);
+                    if (chatsPageState.selectedDialogId) {
+                        loadChatsPageThread(chatsPageState.selectedDialogId, false);
+                    }
+                };
+                userBar.appendChild(syncBtn);
+
+                var logoutBtn = document.createElement('button');
+                logoutBtn.type = 'button';
+                logoutBtn.className = 'b24c-p-btn';
+                logoutBtn.textContent = 'Выйти';
+                logoutBtn.onclick = function () {
+                    sendPluginAction('logoutChat', {}, pendingChat).then(function (res) {
+                        overviewState.authenticated = false;
+                        overviewState.auth = (res && res.auth) || { authenticated: false, oauthConfigured: overviewState.auth && overviewState.auth.oauthConfigured };
+                        overviewState.dialogs = [];
+                        overviewState.unreadNodeIds = {};
+                        overviewState.unreadTotal = 0;
+                        overviewState.unreadDialogsCount = 0;
+                        chatsPageState.selectedDialogId = '';
+                        chatsPageState.messages = [];
+                        updateLeftbarBadge();
+                        highlightUnreadDevices();
+                        responseCache.clear();
+                        renderChatsPageBody();
+                    }).catch(function () {});
+                };
+                userBar.appendChild(logoutBtn);
+            }
+
+            header.appendChild(title);
+            header.appendChild(userBar);
+            page.appendChild(header);
+
+            if (!overviewState.authenticated) {
+                var loginCard = document.createElement('div');
+                loginCard.className = 'b24c-p-login';
+                renderBitrixLoginBlock(
+                    loginCard,
+                    overviewState.auth || { authenticated: false, oauthConfigured: false },
+                    chatsPageState.threadError,
+                    function (newAuth) {
+                        overviewState.authenticated = true;
+                        overviewState.auth = newAuth;
+                        chatsPageState.threadError = '';
+                        refreshChatOverview(true);
+                    },
+                    function (errText) {
+                        chatsPageState.threadError = errText || '';
+                        renderChatsPageBody();
+                    }
+                );
+                page.appendChild(loginCard);
+                return;
+            }
+
+            var layout = document.createElement('div');
+            layout.className = 'b24c-p-layout';
+
+            var sidebar = document.createElement('div');
+            sidebar.className = 'b24c-p-sidebar';
+
+            var controls = document.createElement('div');
+            controls.className = 'b24c-p-controls';
+            var searchInp = document.createElement('input');
+            searchInp.type = 'text';
+            searchInp.className = 'b24c-p-search';
+            searchInp.placeholder = 'Поиск чата, сотрудника или ПК...';
+            searchInp.value = chatsPageState.searchQuery || '';
+            stopKeyPropagation(searchInp);
+            searchInp.oninput = function () {
+                chatsPageState.searchQuery = searchInp.value;
+                renderChatsPageSidebarList();
+            };
+
+            var tabs = document.createElement('div');
+            tabs.className = 'b24c-p-tabs';
+            var tabAll = document.createElement('button');
+            tabAll.type = 'button';
+            tabAll.className = 'b24c-p-tab';
+            tabAll.textContent = 'Все';
+            tabAll.onclick = function () {
+                chatsPageState.filterMode = 'all';
+                renderChatsPageSidebarList();
+            };
+            var tabUnread = document.createElement('button');
+            tabUnread.type = 'button';
+            tabUnread.className = 'b24c-p-tab';
+            tabUnread.textContent = 'Непрочитанные';
+            tabUnread.onclick = function () {
+                chatsPageState.filterMode = 'unread';
+                renderChatsPageSidebarList();
+            };
+            tabs.appendChild(tabAll);
+            tabs.appendChild(tabUnread);
+
+            controls.appendChild(searchInp);
+            controls.appendChild(tabs);
+
+            var dialogList = document.createElement('div');
+            dialogList.className = 'b24c-dialog-list';
+
+            sidebar.appendChild(controls);
+            sidebar.appendChild(dialogList);
+
+            var mainPane = document.createElement('div');
+            mainPane.className = 'b24c-p-main';
+
+            layout.appendChild(sidebar);
+            layout.appendChild(mainPane);
+            page.appendChild(layout);
+
+            renderChatsPageSidebarList();
+            renderChatsPageThreadPane();
+        }
+
+        function openChatsPage(targetDialogId) {
+            var page = ensureChatsPageElement();
+            if (!page) return;
+            var col = document.getElementById('column_l');
+            if (col) {
+                var children = col.children || [];
+                for (var i = 0; i < children.length; i++) {
+                    var child = children[i];
+                    if (child && child !== page && child.style) {
+                        child.style.display = 'none';
+                    }
+                }
+            }
+            if (typeof window.xxcurrentView !== 'undefined') window.xxcurrentView = null;
+            else if (typeof xxcurrentView !== 'undefined') { try { xxcurrentView = null; } catch (e) {} }
+
+            var bar = document.getElementById('page_leftbar');
+            var btn = ensureLeftbarTab();
+            if (bar) {
+                var items = bar.children || [];
+                for (var b = 0; b < items.length; b++) {
+                    var item = items[b];
+                    if (item === btn || !item.style) continue;
+                    item.dataset.b24cHadInlineBg = '1';
+                    item.style.backgroundColor = 'transparent';
+                    item.style.color = '#ffffff';
+                }
+            }
+            if (btn) btn.classList.add('active');
+
+            chatsPageState.open = true;
+            if (targetDialogId) {
+                chatsPageState.selectedDialogId = String(targetDialogId);
+            }
+            page.classList.add('visible');
+            renderChatsPageBody();
+            if (targetDialogId && overviewState.authenticated) {
+                selectDialogOnPage(targetDialogId);
+            }
+            refreshChatOverview(true);
+        }
+
+        function refreshChatOverview(includeDialogs) {
+            if (overviewState.inFlight) return Promise.resolve();
+            overviewState.inFlight = true;
+            var wantDialogs = Boolean(includeDialogs || chatsPageState.open);
+            return sendPluginAction('getChatOverview', {
+                includeDialogs: wantDialogs,
+                nodes: collectVisibleNodes()
+            }, pendingChat)
+                .then(function (res) {
+                    overviewState.inFlight = false;
+                    overviewState.lastFetchedAt = Date.now();
+                    if (!res) return;
+                    if (res.auth) overviewState.auth = res.auth;
+                    if (res.authRequired) {
+                        overviewState.authenticated = false;
+                        overviewState.unreadTotal = 0;
+                        overviewState.unreadNodeIds = {};
+                        updateLeftbarBadge();
+                        highlightUnreadDevices();
+                        if (chatsPageState.open) renderChatsPageBody();
+                        return;
+                    }
+                    if (!res.ok) return;
+
+                    var wasAuth = overviewState.authenticated;
+                    overviewState.authenticated = Boolean(res.authenticated);
+                    overviewState.unreadTotal = Number(res.unreadTotal) || 0;
+                    overviewState.unreadDialogsCount = Number(res.unreadDialogsCount) || 0;
+                    overviewState.unreadNodeIds = (res.unreadNodeIds && typeof res.unreadNodeIds === 'object') ? res.unreadNodeIds : {};
+                    overviewState.nodeToB24 = (res.nodeToB24 && typeof res.nodeToB24 === 'object') ? res.nodeToB24 : {};
+                    if (wantDialogs && Array.isArray(res.dialogs)) {
+                        overviewState.dialogs = res.dialogs;
+                    }
+
+                    updateLeftbarBadge();
+                    highlightUnreadDevices();
+
+                    if (chatsPageState.open) {
+                        if (wasAuth !== overviewState.authenticated || !document.querySelector('#' + CHATS_PAGE_ID + ' .b24c-dialog-list')) {
+                            renderChatsPageBody();
+                        } else {
+                            renderChatsPageSidebarList();
+                        }
+                        if (overviewState.authenticated && chatsPageState.selectedDialogId) {
+                            loadChatsPageThread(chatsPageState.selectedDialogId, true);
+                        }
+                    }
+                })
+                .catch(function () {
+                    overviewState.inFlight = false;
+                });
+        }
+
         function mountMiniChat(container, node, profile, initialAuth) {
             container.replaceChildren();
             var box = document.createElement('div');
@@ -2608,117 +3915,21 @@ function createPlugin(parent) {
                 head.appendChild(title);
                 box.appendChild(head);
 
-                var hint = document.createElement('div');
-                hint.className = 'b24c-muted';
-                hint.textContent = 'Войдите под своим аккаунтом Битрикс24, чтобы видеть последние сообщения и отвечать от своего имени.';
-                box.appendChild(hint);
-
-                if (errMsg) {
-                    var errDiv = document.createElement('div');
-                    errDiv.className = 'b24c-error';
-                    errDiv.textContent = errMsg;
-                    box.appendChild(errDiv);
-                }
-
-                if (currentAuth && currentAuth.oauthConfigured) {
-                    var oauthBtn = document.createElement('button');
-                    oauthBtn.type = 'button';
-                    oauthBtn.className = 'b24c-inline-btn';
-                    oauthBtn.textContent = 'Войти через Битрикс24';
-                    oauthBtn.onclick = function () {
-                        oauthBtn.disabled = true;
-                        sendPluginAction('startOAuth', { origin: window.location.origin }, pendingChat)
-                            .then(function (res) {
-                                oauthBtn.disabled = false;
-                                if (!res || !res.ok || !res.authorizeUrl) {
-                                    renderLoginView((res && res.error) || 'Не удалось начать вход');
-                                    return;
-                                }
-                                var popup = window.open(res.authorizeUrl, 'b24contacts_oauth', 'width=540,height=660');
-                                if (!popup) {
-                                    renderLoginView('Браузер заблокировал всплывающее окно. Разрешите pop-up для этого сайта.');
-                                    return;
-                                }
-                                var checkTimer = setInterval(function () {
-                                    if (popup.closed) {
-                                        clearInterval(checkTimer);
-                                        sendPluginAction('getChatAuth', {}, pendingChat).then(function (authRes) {
-                                            if (authRes && authRes.auth && authRes.auth.authenticated) {
-                                                currentAuth = authRes.auth;
-                                                renderChatView();
-                                            }
-                                        }).catch(function () {});
-                                    }
-                                }, 500);
-                            })
-                            .catch(function (err) {
-                                oauthBtn.disabled = false;
-                                renderLoginView(err && err.message);
-                            });
-                    };
-                    box.appendChild(oauthBtn);
-                } else {
-                    var noOAuthNote = document.createElement('div');
-                    noOAuthNote.className = 'b24c-muted';
-                    noOAuthNote.textContent = 'OAuth-вход не настроен администратором — можно войти по своему личному вебхуку Битрикс24 (права: user, im):';
-                    box.appendChild(noOAuthNote);
-                }
-
-                var altWrap = document.createElement('div');
-                altWrap.className = 'b24c-chat-alt';
-                var altToggle = document.createElement('button');
-                altToggle.type = 'button';
-                altToggle.className = 'b24c-chat-btn-link';
-                altToggle.style.textAlign = 'left';
-                altToggle.style.padding = '0';
-                altToggle.textContent = (currentAuth && currentAuth.oauthConfigured)
-                    ? 'Или войти по личному вебхуку'
-                    : 'Указать личный вебхук';
-
-                var hookForm = document.createElement('form');
-                hookForm.className = 'b24c-chat-form';
-                hookForm.style.display = (currentAuth && currentAuth.oauthConfigured) ? 'none' : 'flex';
-                var hookInput = document.createElement('input');
-                hookInput.type = 'password';
-                hookInput.className = 'b24c-chat-input';
-                hookInput.placeholder = 'https://.../rest/ID/токен/';
-                hookInput.autocomplete = 'off';
-                stopKeyPropagation(hookInput);
-                var hookSave = document.createElement('button');
-                hookSave.type = 'submit';
-                hookSave.className = 'b24c-chat-send';
-                hookSave.textContent = 'Войти';
-                hookForm.appendChild(hookInput);
-                hookForm.appendChild(hookSave);
-
-                altToggle.onclick = function () {
-                    hookForm.style.display = hookForm.style.display === 'none' ? 'flex' : 'none';
-                };
-                hookForm.onsubmit = function (e) {
-                    e.preventDefault();
-                    var val = hookInput.value.trim();
-                    if (!val) return;
-                    hookSave.disabled = true;
-                    sendPluginAction('savePersonalWebhook', { webhookUrl: val }, pendingChat)
-                        .then(function (res) {
-                            hookSave.disabled = false;
-                            if (!res || !res.ok || !res.auth || !res.auth.authenticated) {
-                                renderLoginView((res && res.error) || 'Не удалось проверить личный вебхук');
-                                return;
-                            }
-                            currentAuth = res.auth;
-                            responseCache.clear();
-                            renderChatView();
-                        })
-                        .catch(function (err) {
-                            hookSave.disabled = false;
-                            renderLoginView(err && err.message);
-                        });
-                };
-
-                altWrap.appendChild(altToggle);
-                altWrap.appendChild(hookForm);
-                box.appendChild(altWrap);
+                renderBitrixLoginBlock(
+                    box,
+                    currentAuth,
+                    errMsg,
+                    function (newAuth) {
+                        currentAuth = newAuth;
+                        overviewState.authenticated = true;
+                        overviewState.auth = newAuth;
+                        renderChatView();
+                        refreshChatOverview(false);
+                    },
+                    function (errText) {
+                        renderLoginView(errText);
+                    }
+                );
             }
 
             function renderChatView() {
@@ -2747,6 +3958,11 @@ function createPlugin(parent) {
                     sendPluginAction('logoutChat', {}, pendingChat)
                         .then(function (res) {
                             currentAuth = (res && res.auth) || { authenticated: false, oauthConfigured: currentAuth.oauthConfigured };
+                            overviewState.authenticated = false;
+                            overviewState.unreadTotal = 0;
+                            overviewState.unreadNodeIds = {};
+                            updateLeftbarBadge();
+                            highlightUnreadDevices();
                             responseCache.clear();
                             renderLoginView();
                         })
@@ -2789,43 +4005,9 @@ function createPlugin(parent) {
                 box.appendChild(sendForm);
                 box.appendChild(statusLine);
 
-                function drawMessages(messages) {
-                    msgsBox.replaceChildren();
-                    if (!Array.isArray(messages) || messages.length === 0) {
-                        var empty = document.createElement('div');
-                        empty.className = 'b24c-muted';
-                        empty.textContent = 'Сообщений пока нет — напишите первое';
-                        msgsBox.appendChild(empty);
-                        return;
-                    }
-                    for (var i = 0; i < messages.length; i++) {
-                        var m = messages[i];
-                        var item = document.createElement('div');
-                        item.className = 'b24c-chat-msg' + (m.isMine ? ' mine' : '');
-
-                        var meta = document.createElement('div');
-                        meta.className = 'b24c-chat-meta';
-                        var author = document.createElement('span');
-                        author.textContent = m.isMine ? 'Вы' : (m.authorName || 'Сотрудник');
-                        var tm = document.createElement('span');
-                        tm.textContent = formatMsgTime(m.date);
-                        meta.appendChild(author);
-                        meta.appendChild(tm);
-
-                        var txt = document.createElement('div');
-                        txt.className = 'b24c-chat-text';
-                        txt.textContent = m.text || '';
-
-                        item.appendChild(meta);
-                        item.appendChild(txt);
-                        msgsBox.appendChild(item);
-                    }
-                    msgsBox.scrollTop = msgsBox.scrollHeight;
-                }
-
                 function loadMessages(silent) {
                     if (!silent) statusLine.style.display = 'none';
-                    sendPluginAction('getChatMessages', { nodeId: node._id || '', dialogId: dialogId, limit: 4 }, pendingChat)
+                    sendPluginAction('getChatMessages', { nodeId: node._id || '', dialogId: dialogId, limit: 4, markRead: true }, pendingChat)
                         .then(function (res) {
                             if (!box.parentNode) return;
                             if (res && res.auth) currentAuth = res.auth;
@@ -2841,7 +4023,8 @@ function createPlugin(parent) {
                                 return;
                             }
                             statusLine.style.display = 'none';
-                            drawMessages(res.messages);
+                            clearDialogUnreadLocal(dialogId);
+                            renderMessagesInto(msgsBox, res.messages);
                         })
                         .catch(function (err) {
                             if (!silent && box.parentNode) {
@@ -2862,7 +4045,7 @@ function createPlugin(parent) {
                     msgInput.disabled = true;
                     statusLine.style.display = 'none';
 
-                    sendPluginAction('sendChatMessage', { nodeId: node._id || '', dialogId: dialogId, message: text }, pendingChat)
+                    sendPluginAction('sendChatMessage', { nodeId: node._id || '', dialogId: dialogId, message: text, limit: 4 }, pendingChat)
                         .then(function (res) {
                             sendBtn.disabled = false;
                             msgInput.disabled = false;
@@ -2877,7 +4060,8 @@ function createPlugin(parent) {
                                 return;
                             }
                             msgInput.value = '';
-                            drawMessages(res.messages);
+                            clearDialogUnreadLocal(dialogId);
+                            renderMessagesInto(msgsBox, res.messages);
                             msgInput.focus();
                         })
                         .catch(function (err) {
@@ -3681,7 +4865,10 @@ function createPlugin(parent) {
 
         function handleRefresh() {
             try {
+                injectStyles();
                 ensureAccountLink();
+                ensureLeftbarTab();
+                highlightUnreadDevices();
                 if (!window.currentNode || !window.currentNode._id) return;
                 loadContactsForNode(window.currentNode, false);
             } catch (e) {}
@@ -3694,6 +4881,32 @@ function createPlugin(parent) {
                 summaryBtn.addEventListener('click', function () {
                     setTimeout(handleRefresh, 60);
                 });
+            }
+
+            var leftBar = document.getElementById('page_leftbar');
+            if (leftBar && !leftBar._b24cClickBound && typeof leftBar.addEventListener === 'function') {
+                leftBar._b24cClickBound = true;
+                leftBar.addEventListener('click', function (e) {
+                    var btn = document.getElementById(LEFTBAR_TAB_ID);
+                    if (!btn) return;
+                    if (e.target === btn || (btn.contains && btn.contains(e.target))) return;
+                    if (chatsPageState.open) closeChatsPage();
+                });
+            }
+
+            var devRoot = document.getElementById('xdevices') || document.getElementById('p1');
+            if (devRoot && typeof MutationObserver === 'function' && !devRoot._b24cDevObserver) {
+                var devScheduled = false;
+                var devObs = new MutationObserver(function () {
+                    if (devScheduled) return;
+                    devScheduled = true;
+                    setTimeout(function () {
+                        devScheduled = false;
+                        highlightUnreadDevices();
+                    }, 50);
+                });
+                devObs.observe(devRoot, { childList: true, subtree: true });
+                devRoot._b24cDevObserver = devObs;
             }
 
             var p10 = document.getElementById('p10');
@@ -3726,8 +4939,15 @@ function createPlugin(parent) {
                 setupObservers();
                 handleRefresh();
             },
+            goPageStart: function () {
+                closeChatsPage();
+            },
             onContactsResult: function (message) {
                 if (!message || typeof message !== 'object') return;
+                if (message.chatAuth) {
+                    overviewState.authenticated = Boolean(message.chatAuth.authenticated);
+                    overviewState.auth = message.chatAuth;
+                }
                 var reqId = message.requestId;
                 if (reqId && pendingContacts.has(reqId)) {
                     var entry = pendingContacts.get(reqId);
@@ -3737,6 +4957,9 @@ function createPlugin(parent) {
             },
             onSettingsResult: function (message) {
                 if (!message || typeof message !== 'object') return;
+                if (message.linkSaved || message.saved || message.refreshed) {
+                    setTimeout(function () { refreshChatOverview(chatsPageState.open); }, 50);
+                }
                 var reqId = message.requestId;
                 if (reqId && pendingSettings.has(reqId)) {
                     var entry = pendingSettings.get(reqId);
@@ -3754,10 +4977,13 @@ function createPlugin(parent) {
                 }
             },
             openSettings: openSettingsModal,
+            openChats: openChatsPage,
+            refreshOverview: refreshChatOverview,
             refresh: function () {
                 if (window.currentNode) {
                     loadContactsForNode(window.currentNode, true);
                 }
+                refreshChatOverview(chatsPageState.open);
             }
         };
 
@@ -3765,11 +4991,40 @@ function createPlugin(parent) {
         setInterval(function () {
             if (window.B24ContactsPlugin) window.B24ContactsPlugin.inject();
         }, 1500);
+
+        if (typeof setTimeout === 'function') {
+            setTimeout(function () {
+                refreshChatOverview(false);
+            }, 350);
+        }
+        if (unreadPollTimer) clearInterval(unreadPollTimer);
+        unreadPollTimer = setInterval(function () {
+            if (typeof document !== 'undefined' && document.hidden) return;
+            var now = Date.now();
+            var interval = chatsPageState.open ? 8000 : 12000;
+            if ((now - (overviewState.lastFetchedAt || 0)) >= (interval - 500)) {
+                refreshChatOverview(chatsPageState.open);
+            }
+        }, 4000);
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function' && !window._b24cVisBound) {
+            window._b24cVisBound = true;
+            document.addEventListener('visibilitychange', function () {
+                if (!document.hidden) {
+                    refreshChatOverview(chatsPageState.open);
+                }
+            });
+        }
     };
 
     obj.onDeviceRefreshEnd = function () {
         if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.onDeviceRefreshEnd === 'function') {
             window.B24ContactsPlugin.onDeviceRefreshEnd();
+        }
+    };
+
+    obj.goPageStart = function (pageNum) {
+        if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.goPageStart === 'function') {
+            window.B24ContactsPlugin.goPageStart(pageNum);
         }
     };
 
