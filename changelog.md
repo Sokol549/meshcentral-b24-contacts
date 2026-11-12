@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.0
+- Added embedded 4-message Bitrix24 mini-chat right next to the pharmacy phones on the Device Summary card.
+- Added per-user Bitrix24 authentication (each MeshCentral user logs in with their own Bitrix24 account via OAuth 2.0 Local Application or personal webhook, stored encrypted per user with AES-256-GCM).
+- Added OAuth 2.0 Client ID / Secret settings and Redirect URI display in the admin settings modal.
+
 ## 1.2.0
 - Added direct Bitrix24 Chat (`/online/?IM_DIALOG=<ID>`) and Profile (`/company/personal/user/<ID>/`) links to the Device Summary contacts card.
 

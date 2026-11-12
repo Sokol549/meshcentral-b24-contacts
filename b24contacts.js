@@ -60,23 +60,30 @@ function maskWebhookUrl(rawUrl) {
     }
 }
 
-function buildUserGetUrl(webhookUrl) {
+function buildMethodUrl(webhookUrl, methodName) {
     if (typeof webhookUrl !== 'string' || !webhookUrl.trim()) {
         throw new Error('Bitrix24 webhookUrl не настроен');
     }
+    var method = String(methodName || 'user.get').replace(/\.json$/i, '');
     var trimmed = webhookUrl.trim().replace(/\/+$/, '');
     var parsed = new URL(trimmed);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
         throw new Error('Неподдерживаемый протокол webhookUrl: ' + parsed.protocol);
     }
-    // Strip any sample method suffix (e.g. "/profile.json") from Bitrix24 request generator URLs
     var restBase = /^(.*\/rest\/\d+\/[^/]+)(?:\/.*)?$/i.exec(parsed.pathname);
     if (restBase) {
-        parsed.pathname = restBase[1] + '/user.get.json';
-    } else if (!/\/user\.get(\.json)?$/i.test(parsed.pathname)) {
-        parsed.pathname = parsed.pathname.replace(/\/+$/, '') + '/user.get.json';
+        parsed.pathname = restBase[1] + '/' + method + '.json';
+    } else {
+        var cleanPath = parsed.pathname.replace(/\/+$/, '');
+        if (!new RegExp('\\/' + method.replace('.', '\\.') + '(\\.json)?$', 'i').test(cleanPath)) {
+            parsed.pathname = cleanPath + '/' + method + '.json';
+        }
     }
     return parsed.toString();
+}
+
+function buildUserGetUrl(webhookUrl) {
+    return buildMethodUrl(webhookUrl, 'user.get');
 }
 
 function extractPortalOrigin(webhookUrl, portalUrl) {
@@ -186,12 +193,100 @@ function loadSettings(server) {
             ? merged.webhookUrl.trim()
             : envUrl,
         portalUrl: typeof merged.portalUrl === 'string' ? merged.portalUrl.trim() : '',
+        oauthClientId: typeof merged.oauthClientId === 'string' ? merged.oauthClientId.trim() : '',
+        oauthClientSecret: typeof merged.oauthClientSecret === 'string' ? merged.oauthClientSecret.trim() : '',
         cacheTtlMinutes: clampNumber(merged.cacheTtlMinutes, DEFAULT_CACHE_TTL_MINUTES, 5, 1440),
         minMatchScore: clampNumber(merged.minMatchScore, DEFAULT_MIN_MATCH_SCORE, 0.2, 0.95),
         requestTimeoutMs: clampNumber(merged.requestTimeoutMs, DEFAULT_TIMEOUT_MS, 2000, 60000),
         pageDelayMs: clampNumber(merged.pageDelayMs, DEFAULT_PAGE_DELAY_MS, 0, 5000),
         rejectUnauthorized: merged.rejectUnauthorized !== false
     };
+}
+
+function getUserAuthDir(server) {
+    if (!server || !server.datapath) return null;
+    return path.join(server.datapath, 'b24contacts-users');
+}
+
+function getOrCreateStorageKey(server) {
+    var dir = getUserAuthDir(server);
+    if (!dir) return null;
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    var keyFile = path.join(dir, '.key');
+    if (fs.existsSync(keyFile)) {
+        var existing = fs.readFileSync(keyFile);
+        if (existing.length === 32) return existing;
+    }
+    var fresh = crypto.randomBytes(32);
+    var tmpKey = keyFile + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+    try {
+        fs.writeFileSync(tmpKey, fresh, { mode: 0o600, flag: 'wx' });
+        fs.renameSync(tmpKey, keyFile);
+    } finally {
+        try { if (fs.existsSync(tmpKey)) fs.unlinkSync(tmpKey); } catch (e) {}
+    }
+    return fresh;
+}
+
+function getUserAuthFilePath(server, meshUserId) {
+    var dir = getUserAuthDir(server);
+    if (!dir || typeof meshUserId !== 'string' || !meshUserId) return null;
+    var hash = crypto.createHash('sha256').update(meshUserId).digest('hex');
+    return path.join(dir, hash + '.json');
+}
+
+function readUserChatAuth(server, meshUserId) {
+    var filePath = getUserAuthFilePath(server, meshUserId);
+    if (!filePath) return null;
+    try {
+        if (!fs.existsSync(filePath)) return null;
+        var key = getOrCreateStorageKey(server);
+        if (!key) return null;
+        var envelope = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        var decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
+        decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+        var plain = Buffer.concat([
+            decipher.update(Buffer.from(envelope.data, 'base64')),
+            decipher.final()
+        ]).toString('utf8');
+        return JSON.parse(plain);
+    } catch (e) {
+        console.warn('[b24contacts] Не удалось прочитать сессию чата пользователя:', e.message);
+        return null;
+    }
+}
+
+function writeUserChatAuth(server, meshUserId, authObj) {
+    var filePath = getUserAuthFilePath(server, meshUserId);
+    if (!filePath) throw new Error('Каталог данных MeshCentral (datapath) недоступен');
+    var key = getOrCreateStorageKey(server);
+    var iv = crypto.randomBytes(12);
+    var cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    var enc = Buffer.concat([cipher.update(JSON.stringify(authObj), 'utf8'), cipher.final()]);
+    var tag = cipher.getAuthTag();
+    var envelope = {
+        v: 1,
+        iv: iv.toString('base64'),
+        tag: tag.toString('base64'),
+        data: enc.toString('base64')
+    };
+    var tmpPath = filePath + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+    try {
+        fs.writeFileSync(tmpPath, JSON.stringify(envelope), { mode: 0o600, flag: 'wx' });
+        fs.renameSync(tmpPath, filePath);
+    } finally {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+    }
+}
+
+function deleteUserChatAuth(server, meshUserId) {
+    var filePath = getUserAuthFilePath(server, meshUserId);
+    if (!filePath) return;
+    try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (e) {}
 }
 
 function normalizeAndTokenize(raw) {
@@ -515,12 +610,12 @@ function findBestContactMatch(nodeName, cachedUsers, minScore) {
     };
 }
 
-function postJson(targetUrl, payload, options, redirectCount) {
+function requestJson(targetUrl, bodyString, contentType, options, redirectCount) {
     var hops = redirectCount || 0;
     return new Promise(function (resolve, reject) {
         try {
             var parsed = new URL(targetUrl);
-            var body = JSON.stringify(payload || {});
+            var body = bodyString || '';
             var transport = parsed.protocol === 'http:' ? http : https;
             var reqOpts = {
                 protocol: parsed.protocol,
@@ -529,7 +624,7 @@ function postJson(targetUrl, payload, options, redirectCount) {
                 path: parsed.pathname + parsed.search,
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
+                    'Content-Type': contentType,
                     'Accept': 'application/json',
                     'Content-Length': Buffer.byteLength(body)
                 }
@@ -547,7 +642,7 @@ function postJson(targetUrl, payload, options, redirectCount) {
                     res.resume();
                     settled = true;
                     var nextUrl = new URL(res.headers.location, parsed).toString();
-                    postJson(nextUrl, payload, options, hops + 1).then(resolve, reject);
+                    requestJson(nextUrl, bodyString, contentType, options, hops + 1).then(resolve, reject);
                     return;
                 }
 
@@ -573,16 +668,24 @@ function postJson(targetUrl, payload, options, redirectCount) {
                     try {
                         data = JSON.parse(raw);
                     } catch (e) {
-                        reject(new Error('Некорректный JSON от Bitrix24 (HTTP ' + status + ')'));
+                        var parseErr = new Error('Некорректный JSON от Bitrix24 (HTTP ' + status + ')');
+                        parseErr.httpStatus = status;
+                        reject(parseErr);
                         return;
                     }
                     if (status < 200 || status >= 300) {
                         var errMsg = (data && (data.error_description || data.error)) || ('HTTP ' + status);
-                        reject(new Error('Ошибка Bitrix24: ' + errMsg));
+                        var httpErr = new Error('Ошибка Bitrix24: ' + errMsg);
+                        httpErr.httpStatus = status;
+                        httpErr.b24Code = data && data.error;
+                        reject(httpErr);
                         return;
                     }
                     if (data && data.error) {
-                        reject(new Error('Ошибка Bitrix24 API: ' + (data.error_description || data.error)));
+                        var apiErr = new Error('Ошибка Bitrix24 API: ' + (data.error_description || data.error));
+                        apiErr.httpStatus = status;
+                        apiErr.b24Code = data.error;
+                        reject(apiErr);
                         return;
                     }
                     resolve(data);
@@ -608,6 +711,29 @@ function postJson(targetUrl, payload, options, redirectCount) {
             reject(err);
         }
     });
+}
+
+function postJson(targetUrl, payload, options) {
+    return requestJson(targetUrl, JSON.stringify(payload || {}), 'application/json', options, 0);
+}
+
+function postForm(targetUrl, paramsObj, options) {
+    var usp = new URLSearchParams();
+    Object.keys(paramsObj || {}).forEach(function (k) {
+        if (paramsObj[k] != null) usp.set(k, String(paramsObj[k]));
+    });
+    return requestJson(targetUrl, usp.toString(), 'application/x-www-form-urlencoded', options, 0);
+}
+
+function cleanBitrixBbCode(text) {
+    if (typeof text !== 'string') return '';
+    return text
+        .replace(/\[BR\s*\/?\]/gi, '\n')
+        .replace(/\[URL=([^\]]*)\]([\s\S]*?)\[\/URL\]/gi, '$2')
+        .replace(/\[USER=[^\]]*\]([\s\S]*?)\[\/USER\]/gi, '$1')
+        .replace(/\[CHAT=[^\]]*\]([\s\S]*?)\[\/CHAT\]/gi, '$1')
+        .replace(/\[\/?(?:B|I|U|S|SIZE|COLOR|QUOTE|CODE|LIST|DISK)[^\]]*\]/gi, '')
+        .trim();
 }
 
 function delay(ms) {
@@ -842,11 +968,287 @@ function createPlugin(parent) {
         };
     }
 
+    var oauthStates = new Map();
+
+    function cleanupOAuthStates() {
+        var now = Date.now();
+        oauthStates.forEach(function (entry, key) {
+            if (!entry || (now - entry.createdAt) > 10 * 60 * 1000) {
+                oauthStates.delete(key);
+            }
+        });
+    }
+
+    function getSafePortalOrigin(settings) {
+        return extractPortalOrigin(settings.webhookUrl, settings.portalUrl);
+    }
+
+    function getUserChatAuthStatus(meshUserId, settings) {
+        var s = settings || getSettings();
+        var auth = readUserChatAuth(getServer(), meshUserId);
+        var portalOrigin = getSafePortalOrigin(s);
+        var oauthConfigured = Boolean(s.oauthClientId && s.oauthClientSecret && portalOrigin);
+        if (!auth) {
+            return {
+                authenticated: false,
+                mode: null,
+                b24UserId: '',
+                b24UserName: '',
+                oauthConfigured: oauthConfigured
+            };
+        }
+        return {
+            authenticated: true,
+            mode: auth.mode || 'oauth',
+            b24UserId: auth.b24UserId || '',
+            b24UserName: auth.b24UserName || '',
+            oauthConfigured: oauthConfigured
+        };
+    }
+
+    async function refreshOAuthToken(settings, auth) {
+        var portalOrigin = getSafePortalOrigin(settings);
+        if (!portalOrigin || !settings.oauthClientId || !settings.oauthClientSecret || !auth || !auth.refreshToken) {
+            throw new Error('Невозможно обновить OAuth-токен Битрикс24');
+        }
+        var data = await postForm(
+            portalOrigin + '/oauth/token/',
+            {
+                grant_type: 'refresh_token',
+                client_id: settings.oauthClientId,
+                client_secret: settings.oauthClientSecret,
+                refresh_token: auth.refreshToken
+            },
+            {
+                timeoutMs: settings.requestTimeoutMs,
+                rejectUnauthorized: settings.rejectUnauthorized
+            }
+        );
+        if (!data || !data.access_token) {
+            throw new Error('Битрикс24 не вернул новый access_token');
+        }
+        var expiresIn = Number(data.expires_in) || 3600;
+        return Object.assign({}, auth, {
+            mode: 'oauth',
+            accessToken: String(data.access_token),
+            refreshToken: data.refresh_token ? String(data.refresh_token) : auth.refreshToken,
+            expiresAt: Date.now() + expiresIn * 1000
+        });
+    }
+
+    async function callBitrixAsUser(meshUserId, method, params) {
+        var server = getServer();
+        var settings = getSettings();
+        var auth = readUserChatAuth(server, meshUserId);
+        if (!auth) {
+            var authErr = new Error('Требуется вход в свой аккаунт Битрикс24');
+            authErr.authRequired = true;
+            throw authErr;
+        }
+
+        var reqOpts = {
+            timeoutMs: settings.requestTimeoutMs,
+            rejectUnauthorized: settings.rejectUnauthorized
+        };
+
+        if (auth.mode === 'webhook') {
+            var hookUrl = buildMethodUrl(auth.personalWebhookUrl, method);
+            return await postJson(hookUrl, params || {}, reqOpts);
+        }
+
+        var portalOrigin = getSafePortalOrigin(settings);
+        if (!portalOrigin) {
+            throw new Error('Не указан адрес портала Битрикс24');
+        }
+
+        var currentAuth = auth;
+        if (currentAuth.expiresAt && Date.now() > (currentAuth.expiresAt - 60000) && currentAuth.refreshToken) {
+            try {
+                currentAuth = await refreshOAuthToken(settings, currentAuth);
+                writeUserChatAuth(server, meshUserId, currentAuth);
+            } catch (refreshErr) {
+                deleteUserChatAuth(server, meshUserId);
+                var expiredErr = new Error('Сессия Битрикс24 истекла, войдите повторно');
+                expiredErr.authRequired = true;
+                throw expiredErr;
+            }
+        }
+
+        var endpoint = portalOrigin + '/rest/' + String(method).replace(/\.json$/i, '') + '.json';
+        try {
+            return await postJson(endpoint, Object.assign({}, params || {}, { auth: currentAuth.accessToken }), reqOpts);
+        } catch (err) {
+            var isExpired = err && (err.httpStatus === 401 || /expired_token|invalid_token/i.test(String(err.b24Code || err.message)));
+            if (isExpired && currentAuth.refreshToken) {
+                try {
+                    currentAuth = await refreshOAuthToken(settings, currentAuth);
+                    writeUserChatAuth(server, meshUserId, currentAuth);
+                    return await postJson(endpoint, Object.assign({}, params || {}, { auth: currentAuth.accessToken }), reqOpts);
+                } catch (retryErr) {
+                    deleteUserChatAuth(server, meshUserId);
+                    var reloginErr = new Error('Сессия Битрикс24 истекла, войдите повторно');
+                    reloginErr.authRequired = true;
+                    throw reloginErr;
+                }
+            }
+            if (isExpired) {
+                deleteUserChatAuth(server, meshUserId);
+                err.authRequired = true;
+            }
+            throw err;
+        }
+    }
+
+    async function fetchChatMessagesForUser(meshUserId, dialogId, limit) {
+        var safeDialogId = typeof dialogId === 'string' || typeof dialogId === 'number' ? String(dialogId).trim() : '';
+        if (!/^[a-zA-Z0-9_-]+$/.test(safeDialogId)) {
+            throw new Error('Некорректный идентификатор диалога Битрикс24');
+        }
+        var maxCount = clampNumber(limit, 4, 1, 20);
+        var auth = readUserChatAuth(getServer(), meshUserId);
+        var myB24Id = auth && auth.b24UserId ? String(auth.b24UserId) : '';
+
+        var data;
+        try {
+            data = await callBitrixAsUser(meshUserId, 'im.dialog.messages.get', {
+                DIALOG_ID: safeDialogId,
+                LIMIT: maxCount
+            });
+        } catch (err) {
+            var code = String((err && (err.b24Code || err.message)) || '');
+            if (/DIALOG_NOT_FOUND|CHAT_ID_EMPTY/i.test(code)) {
+                return { messages: [], auth: getUserChatAuthStatus(meshUserId) };
+            }
+            throw err;
+        }
+
+        var result = (data && data.result) || {};
+        var usersList = Array.isArray(result.users) ? result.users : [];
+        var userMap = {};
+        for (var u = 0; u < usersList.length; u++) {
+            var usr = usersList[u];
+            if (usr && usr.id != null) {
+                userMap[String(usr.id)] = usr.name ? String(usr.name) : ('ID ' + usr.id);
+            }
+        }
+
+        var rawMsgs = Array.isArray(result.messages) ? result.messages : [];
+        var normalized = rawMsgs.map(function (m) {
+            var authorId = m.author_id != null ? String(m.author_id) : '0';
+            var authorName = authorId === '0'
+                ? 'Система'
+                : (userMap[authorId] || (myB24Id && authorId === myB24Id ? (auth.b24UserName || 'Вы') : ('Сотрудник #' + authorId)));
+            var text = cleanBitrixBbCode(m.text != null ? String(m.text) : '');
+            if (!text && Array.isArray(m.params && m.params.FILE_ID) && m.params.FILE_ID.length) {
+                text = '[Файл]';
+            }
+            return {
+                id: Number(m.id) || 0,
+                authorId: authorId,
+                authorName: authorName,
+                isMine: Boolean(myB24Id && authorId === myB24Id),
+                date: m.date ? String(m.date) : '',
+                text: text || '(сообщение без текста)'
+            };
+        });
+
+        normalized.sort(function (a, b) { return a.id - b.id; });
+        if (normalized.length > maxCount) {
+            normalized = normalized.slice(normalized.length - maxCount);
+        }
+
+        return {
+            messages: normalized,
+            auth: getUserChatAuthStatus(meshUserId)
+        };
+    }
+
+    async function sendChatMessageForUser(meshUserId, dialogId, messageText) {
+        var safeDialogId = typeof dialogId === 'string' || typeof dialogId === 'number' ? String(dialogId).trim() : '';
+        if (!/^[a-zA-Z0-9_-]+$/.test(safeDialogId)) {
+            throw new Error('Некорректный идентификатор диалога Битрикс24');
+        }
+        var text = typeof messageText === 'string' ? messageText.trim() : '';
+        if (!text) throw new Error('Введите текст сообщения');
+        if (text.length > 4000) throw new Error('Сообщение слишком длинное (максимум 4000 символов)');
+
+        await callBitrixAsUser(meshUserId, 'im.message.add', {
+            DIALOG_ID: safeDialogId,
+            MESSAGE: text
+        });
+
+        return await fetchChatMessagesForUser(meshUserId, safeDialogId, 4);
+    }
+
+    async function completeOAuthCallback(code, state) {
+        cleanupOAuthStates();
+        var stateEntry = (typeof state === 'string' && oauthStates.has(state)) ? oauthStates.get(state) : null;
+        if (!stateEntry) {
+            throw new Error('Ссылка авторизации устарела или уже использована. Повторите вход из MeshCentral.');
+        }
+        oauthStates.delete(state);
+
+        var settings = getSettings();
+        var portalOrigin = getSafePortalOrigin(settings);
+        if (!portalOrigin || !settings.oauthClientId || !settings.oauthClientSecret) {
+            throw new Error('OAuth-приложение Битрикс24 не настроено администратором MeshCentral.');
+        }
+
+        var tokenData = await postForm(
+            portalOrigin + '/oauth/token/',
+            {
+                grant_type: 'authorization_code',
+                client_id: settings.oauthClientId,
+                client_secret: settings.oauthClientSecret,
+                code: String(code || ''),
+                redirect_uri: stateEntry.redirectUri
+            },
+            {
+                timeoutMs: settings.requestTimeoutMs,
+                rejectUnauthorized: settings.rejectUnauthorized
+            }
+        );
+
+        if (!tokenData || !tokenData.access_token) {
+            throw new Error('Битрикс24 не выдал access_token');
+        }
+
+        var meData = await postJson(
+            portalOrigin + '/rest/user.current.json',
+            { auth: String(tokenData.access_token) },
+            {
+                timeoutMs: settings.requestTimeoutMs,
+                rejectUnauthorized: settings.rejectUnauthorized
+            }
+        );
+        var me = (meData && meData.result) || {};
+        var b24Name = [me.NAME, me.LAST_NAME].filter(Boolean).join(' ').trim() || me.EMAIL || ('ID ' + (me.ID || ''));
+        var expiresIn = Number(tokenData.expires_in) || 3600;
+
+        writeUserChatAuth(getServer(), stateEntry.userId, {
+            mode: 'oauth',
+            accessToken: String(tokenData.access_token),
+            refreshToken: tokenData.refresh_token ? String(tokenData.refresh_token) : '',
+            expiresAt: Date.now() + expiresIn * 1000,
+            b24UserId: me.ID != null ? String(me.ID) : '',
+            b24UserName: b24Name
+        });
+
+        return {
+            userId: stateEntry.userId,
+            auth: getUserChatAuthStatus(stateEntry.userId, settings)
+        };
+    }
+
     function getSettingsSummary(settings) {
         var s = settings || getSettings();
         return {
             hasWebhook: Boolean(s.webhookUrl),
             maskedWebhookUrl: maskWebhookUrl(s.webhookUrl),
+            portalUrl: s.portalUrl,
+            oauthClientId: s.oauthClientId,
+            hasOAuthSecret: Boolean(s.oauthClientSecret),
+            oauthConfigured: Boolean(s.oauthClientId && s.oauthClientSecret && getSafePortalOrigin(s)),
             cacheTtlMinutes: s.cacheTtlMinutes,
             minMatchScore: s.minMatchScore,
             requestTimeoutMs: s.requestTimeoutMs,
@@ -880,6 +1282,14 @@ function createPlugin(parent) {
         return server.app || (server.webserver && server.webserver.app) || null;
     }
 
+    function escapeHtmlText(str) {
+        return String(str || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
     function registerRoutes(app) {
         if (!app || typeof app.get !== 'function') return false;
         if (app._b24ContactsRoutesRegistered) return true;
@@ -906,9 +1316,39 @@ function createPlugin(parent) {
             }
         });
 
-        // Promote plugin routes ahead of MeshCentral's catch-all 404 middleware
-        if (app._router && Array.isArray(app._router.stack)) {
-            var stack = app._router.stack;
+        app.get('/plugin/b24contacts/oauth/callback', async function (req, res) {
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            try {
+                if (req.query && req.query.error) {
+                    throw new Error(String(req.query.error_description || req.query.error));
+                }
+                if (!req.query || !req.query.code || !req.query.state) {
+                    throw new Error('Отсутствуют параметры code или state от Битрикс24');
+                }
+                await completeOAuthCallback(req.query.code, req.query.state);
+                return res.status(200).send(
+                    '<!doctype html><meta charset="utf-8"><title>Битрикс24</title>' +
+                    '<body style="font:14px Arial,sans-serif;padding:24px;text-align:center">' +
+                    '<h3>Вход в Битрикс24 выполнен</h3><p>Окно закроется автоматически…</p>' +
+                    '<script>try{if(window.opener){window.opener.postMessage({type:"b24c-oauth-done",ok:true},window.location.origin);}}catch(e){}setTimeout(function(){window.close();},300);</script>' +
+                    '</body>'
+                );
+            } catch (err) {
+                return res.status(400).send(
+                    '<!doctype html><meta charset="utf-8"><title>Ошибка входа Битрикс24</title>' +
+                    '<body style="font:14px Arial,sans-serif;padding:24px">' +
+                    '<h3>Не удалось выполнить вход в Битрикс24</h3><p>' + escapeHtmlText(err && err.message) + '</p>' +
+                    '<script>try{if(window.opener){window.opener.postMessage({type:"b24c-oauth-done",ok:false,error:' + JSON.stringify(String((err && err.message) || 'Ошибка')) + '},window.location.origin);}}catch(e){}</script>' +
+                    '</body>'
+                );
+            }
+        });
+
+        // Promote plugin routes ahead of MeshCentral's catch-all 404 middleware (Express 4 & Express 5)
+        var routerObj = app._router || app.router;
+        if (routerObj && Array.isArray(routerObj.stack)) {
+            var stack = routerObj.stack;
             var layers = [];
             for (var i = stack.length - 1; i >= 0; i--) {
                 var routePath = stack[i] && stack[i].route ? stack[i].route.path : '';
@@ -1041,6 +1481,7 @@ function createPlugin(parent) {
                     }
 
                     var result = await lookupContacts(nodeName);
+                    result.chatAuth = getUserChatAuthStatus(client.user._id);
                     sendToClient(client, Object.assign({
                         action: 'plugin',
                         plugin: PLUGIN_NAME,
@@ -1113,9 +1554,16 @@ function createPlugin(parent) {
                     if (nextWebhookUrl) {
                         buildUserGetUrl(nextWebhookUrl);
                     }
+                    var rawOAuthSecret = typeof incoming.oauthClientSecret === 'string' ? incoming.oauthClientSecret.trim() : '';
+                    var nextOAuthSecret = rawOAuthSecret || current.oauthClientSecret;
+                    if (incoming.clearOAuthSecret === true) {
+                        nextOAuthSecret = '';
+                    }
                     var nextSettings = {
                         webhookUrl: nextWebhookUrl,
                         portalUrl: typeof incoming.portalUrl === 'string' ? incoming.portalUrl.trim() : current.portalUrl,
+                        oauthClientId: typeof incoming.oauthClientId === 'string' ? incoming.oauthClientId.trim() : current.oauthClientId,
+                        oauthClientSecret: nextOAuthSecret,
                         cacheTtlMinutes: clampNumber(incoming.cacheTtlMinutes, current.cacheTtlMinutes, 5, 1440),
                         minMatchScore: clampNumber(incoming.minMatchScore, current.minMatchScore, 0.2, 0.95),
                         requestTimeoutMs: clampNumber(incoming.requestTimeoutMs, current.requestTimeoutMs, 2000, 60000),
@@ -1226,6 +1674,186 @@ function createPlugin(parent) {
                     error: err && err.message
                 });
             });
+            return;
+        }
+
+        if (action === 'getChatAuth') {
+            sendToClient(client, {
+                action: 'plugin',
+                plugin: PLUGIN_NAME,
+                method: 'onChatResult',
+                requestId: requestId,
+                ok: true,
+                auth: getUserChatAuthStatus(client.user._id)
+            });
+            return;
+        }
+
+        if (action === 'startOAuth') {
+            try {
+                var s = getSettings();
+                var portalOrigin = getSafePortalOrigin(s);
+                if (!portalOrigin || !s.oauthClientId || !s.oauthClientSecret) {
+                    throw new Error('Администратор ещё не настроил OAuth-приложение Битрикс24 в настройках плагина');
+                }
+                var origin = typeof command.origin === 'string' && /^https?:\/\/[^/\s]+$/i.test(command.origin.trim())
+                    ? command.origin.trim()
+                    : '';
+                if (!origin) throw new Error('Не удалось определить адрес сервера MeshCentral для обратного редиректа');
+                var redirectUri = origin + '/plugin/b24contacts/oauth/callback';
+                cleanupOAuthStates();
+                var stateToken = crypto.randomBytes(24).toString('hex');
+                oauthStates.set(stateToken, {
+                    userId: client.user._id,
+                    redirectUri: redirectUri,
+                    createdAt: Date.now()
+                });
+                var authUrl = portalOrigin + '/oauth/authorize/?client_id=' + encodeURIComponent(s.oauthClientId) +
+                    '&response_type=code&redirect_uri=' + encodeURIComponent(redirectUri) +
+                    '&state=' + encodeURIComponent(stateToken);
+                sendToClient(client, {
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onChatResult',
+                    requestId: requestId,
+                    ok: true,
+                    authorizeUrl: authUrl
+                });
+            } catch (err) {
+                sendToClient(client, {
+                    action: 'plugin',
+                    plugin: PLUGIN_NAME,
+                    method: 'onChatResult',
+                    requestId: requestId,
+                    ok: false,
+                    error: err && err.message
+                });
+            }
+            return;
+        }
+
+        if (action === 'savePersonalWebhook') {
+            (async function () {
+                try {
+                    var hookUrl = typeof command.webhookUrl === 'string' ? command.webhookUrl.trim() : '';
+                    var meUrl = buildMethodUrl(hookUrl, 'user.current');
+                    var s = getSettings();
+                    var meData = await postJson(meUrl, {}, {
+                        timeoutMs: s.requestTimeoutMs,
+                        rejectUnauthorized: s.rejectUnauthorized
+                    });
+                    var me = (meData && meData.result) || {};
+                    var b24Name = [me.NAME, me.LAST_NAME].filter(Boolean).join(' ').trim() || me.EMAIL || ('ID ' + (me.ID || ''));
+                    writeUserChatAuth(getServer(), client.user._id, {
+                        mode: 'webhook',
+                        personalWebhookUrl: hookUrl,
+                        b24UserId: me.ID != null ? String(me.ID) : '',
+                        b24UserName: b24Name
+                    });
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        ok: true,
+                        auth: getUserChatAuthStatus(client.user._id, s)
+                    });
+                } catch (err) {
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        ok: false,
+                        error: err && err.message ? err.message : 'Не удалось проверить личный вебхук'
+                    });
+                }
+            })();
+            return;
+        }
+
+        if (action === 'logoutChat') {
+            deleteUserChatAuth(getServer(), client.user._id);
+            sendToClient(client, {
+                action: 'plugin',
+                plugin: PLUGIN_NAME,
+                method: 'onChatResult',
+                requestId: requestId,
+                ok: true,
+                auth: getUserChatAuthStatus(client.user._id)
+            });
+            return;
+        }
+
+        if (action === 'getChatMessages') {
+            var chatNodeId = typeof command.nodeId === 'string' ? command.nodeId : '';
+            var dialogId = typeof command.dialogId === 'string' ? command.dialogId : '';
+            (async function () {
+                try {
+                    var hasAccess = await verifyNodeAccess(client, chatNodeId);
+                    if (!hasAccess) throw new Error('Доступ к устройству запрещён');
+                    var res = await fetchChatMessagesForUser(client.user._id, dialogId, command.limit || 4);
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        dialogId: dialogId,
+                        ok: true,
+                        messages: res.messages,
+                        auth: res.auth
+                    });
+                } catch (err) {
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        dialogId: dialogId,
+                        ok: false,
+                        authRequired: Boolean(err && err.authRequired),
+                        auth: getUserChatAuthStatus(client.user._id),
+                        error: err && err.message ? err.message : 'Ошибка загрузки чата'
+                    });
+                }
+            })();
+            return;
+        }
+
+        if (action === 'sendChatMessage') {
+            var sendNodeId = typeof command.nodeId === 'string' ? command.nodeId : '';
+            var sendDialogId = typeof command.dialogId === 'string' ? command.dialogId : '';
+            var msgText = typeof command.message === 'string' ? command.message : '';
+            (async function () {
+                try {
+                    var hasAccess = await verifyNodeAccess(client, sendNodeId);
+                    if (!hasAccess) throw new Error('Доступ к устройству запрещён');
+                    var res = await sendChatMessageForUser(client.user._id, sendDialogId, msgText);
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        dialogId: sendDialogId,
+                        ok: true,
+                        sent: true,
+                        messages: res.messages,
+                        auth: res.auth
+                    });
+                } catch (err) {
+                    sendToClient(client, {
+                        action: 'plugin',
+                        plugin: PLUGIN_NAME,
+                        method: 'onChatResult',
+                        requestId: requestId,
+                        dialogId: sendDialogId,
+                        ok: false,
+                        authRequired: Boolean(err && err.authRequired),
+                        auth: getUserChatAuthStatus(client.user._id),
+                        error: err && err.message ? err.message : 'Не удалось отправить сообщение'
+                    });
+                }
+            })();
         }
     };
 
@@ -1237,16 +1865,21 @@ function createPlugin(parent) {
         findBestContactMatch: findBestContactMatch,
         normalizeBitrixUser: normalizeBitrixUser,
         scoreCandidate: scoreCandidate,
+        buildMethodUrl: buildMethodUrl,
         buildUserGetUrl: buildUserGetUrl,
         maskWebhookUrl: maskWebhookUrl,
         loadSettings: loadSettings,
         writeSavedSettings: writeSavedSettings,
+        readUserChatAuth: readUserChatAuth,
+        writeUserChatAuth: writeUserChatAuth,
+        completeOAuthCallback: completeOAuthCallback,
+        oauthStates: oauthStates,
         refreshCache: refreshCache,
         getCacheState: function () { return cache; }
     };
 
     // Browser-serialized hooks (MUST NOT reference Node closure variables)
-    obj.exports = ['onWebUIStartupEnd', 'onDeviceRefreshEnd', 'onContactsResult', 'onSettingsResult', 'openSettings'];
+    obj.exports = ['onWebUIStartupEnd', 'onDeviceRefreshEnd', 'onContactsResult', 'onSettingsResult', 'onChatResult', 'openSettings'];
 
     obj.onWebUIStartupEnd = function () {
         if (window.B24ContactsPlugin) {
@@ -1264,9 +1897,27 @@ function createPlugin(parent) {
 
         var pendingContacts = new Map();
         var pendingSettings = new Map();
+        var pendingChat = new Map();
         var responseCache = new Map();
         var requestSeq = 0;
         var configRevision = 0;
+        var chatPollTimer = null;
+        var activeChatContext = null;
+
+        if (typeof window.addEventListener === 'function' && !window._b24cOAuthListenerBound) {
+            window._b24cOAuthListenerBound = true;
+            window.addEventListener('message', function (ev) {
+                try {
+                    if (ev.origin !== window.location.origin) return;
+                    if (!ev.data || ev.data.type !== 'b24c-oauth-done') return;
+                    responseCache.clear();
+                    configRevision++;
+                    if (window.currentNode) {
+                        loadContactsForNode(window.currentNode, true);
+                    }
+                } catch (e) {}
+            });
+        }
 
         function isCurrentUserAdmin() {
             var u = window.userinfo;
@@ -1281,13 +1932,14 @@ function createPlugin(parent) {
             var style = document.createElement('style');
             style.id = STYLE_ID;
             style.textContent = [
-                '#' + CARD_ID + '{clear:both;margin:10px 0 12px;padding:11px 14px;border:1px solid #d5dce6;border-radius:6px;background:rgba(248,250,252,0.95);color:#1e293b;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;box-sizing:border-box;max-width:680px}',
+                '#' + CARD_ID + '{clear:both;margin:10px 0 12px;padding:11px 14px;border:1px solid #d5dce6;border-radius:6px;background:rgba(248,250,252,0.95);color:#1e293b;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;box-sizing:border-box;max-width:900px}',
                 '#' + CARD_ID + ' .b24c-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #e2e8f0}',
                 '#' + CARD_ID + ' .b24c-title{margin:0;font-size:13px;font-weight:700;color:#0f172a;display:flex;align-items:center;gap:6px}',
                 '#' + CARD_ID + ' .b24c-actions{display:flex;align-items:center;gap:4px}',
                 '#' + CARD_ID + ' .b24c-icon-btn{background:transparent;border:1px solid #cbd5e1;border-radius:4px;color:#475569;cursor:pointer;font-size:12px;line-height:1;padding:3px 7px}',
                 '#' + CARD_ID + ' .b24c-icon-btn:hover{background:#e2e8f0;color:#0f172a}',
                 '#' + CARD_ID + ' .b24c-icon-btn:disabled{opacity:0.5;cursor:default}',
+                '#' + CARD_ID + ' .b24c-grid{display:grid;grid-template-columns:minmax(230px,1fr) minmax(270px,1.25fr);gap:14px;align-items:start}',
                 '#' + CARD_ID + ' .b24c-loader-wrap{display:flex;align-items:center;gap:8px;color:#64748b;padding:2px 0}',
                 '#' + CARD_ID + ' .b24c-spinner{width:14px;height:14px;border:2px solid #cbd5e1;border-top-color:#2563eb;border-radius:50%;animation:b24c-spin 0.8s linear infinite;flex-shrink:0}',
                 '#' + CARD_ID + ' .b24c-profile{font-size:12px;color:#475569;margin-bottom:6px;word-break:break-word}',
@@ -1301,10 +1953,28 @@ function createPlugin(parent) {
                 '#' + CARD_ID + ' .b24c-pill{display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;color:#1d4ed8;font-size:12px;font-weight:600;text-decoration:none}',
                 '#' + CARD_ID + ' .b24c-pill:hover{background:#eff6ff;border-color:#93c5fd;text-decoration:none}',
                 '#' + CARD_ID + ' .b24c-pill svg{width:14px;height:14px;flex-shrink:0}',
+                '#' + CARD_ID + ' .b24c-chat-box{background:#fff;border:1px solid #dce3ec;border-radius:5px;padding:8px 10px;display:flex;flex-direction:column;gap:6px}',
+                '#' + CARD_ID + ' .b24c-chat-head{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;color:#475569;border-bottom:1px solid #edf2f7;padding-bottom:4px}',
+                '#' + CARD_ID + ' .b24c-chat-me{font-weight:600;color:#0f172a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+                '#' + CARD_ID + ' .b24c-chat-head-btns{display:flex;align-items:center;gap:4px;flex-shrink:0}',
+                '#' + CARD_ID + ' .b24c-chat-btn-link{background:none;border:none;color:#64748b;cursor:pointer;font-size:11px;padding:1px 4px;text-decoration:underline}',
+                '#' + CARD_ID + ' .b24c-chat-btn-link:hover{color:#0f172a}',
+                '#' + CARD_ID + ' .b24c-chat-msgs{display:flex;flex-direction:column;gap:4px;max-height:145px;overflow-y:auto;padding-right:2px}',
+                '#' + CARD_ID + ' .b24c-chat-msg{padding:5px 7px;border-radius:4px;background:#f1f5f9;font-size:12px;line-height:1.35;word-break:break-word}',
+                '#' + CARD_ID + ' .b24c-chat-msg.mine{background:#e0f2fe}',
+                '#' + CARD_ID + ' .b24c-chat-meta{font-size:10px;color:#64748b;margin-bottom:2px;display:flex;justify-content:space-between;gap:6px}',
+                '#' + CARD_ID + ' .b24c-chat-text{color:#0f172a;white-space:pre-wrap}',
+                '#' + CARD_ID + ' .b24c-chat-form{display:flex;gap:6px;align-items:center}',
+                '#' + CARD_ID + ' .b24c-chat-input{flex:1;min-width:0;height:28px;padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font:12px Arial,sans-serif;color:#0f172a;background:#fff}',
+                '#' + CARD_ID + ' .b24c-chat-send{height:28px;padding:0 10px;border:1px solid #1769f5;border-radius:4px;background:#1769f5;color:#fff;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}',
+                '#' + CARD_ID + ' .b24c-chat-send:hover{background:#0758d8}',
+                '#' + CARD_ID + ' .b24c-chat-send:disabled{opacity:0.55;cursor:default}',
+                '#' + CARD_ID + ' .b24c-chat-alt{display:flex;flex-direction:column;gap:6px;margin-top:4px}',
                 '#' + CARD_ID + ' .b24c-muted{color:#6b7280;font-size:12px}',
                 '#' + CARD_ID + ' .b24c-error{color:#b91c1c;font-size:12px}',
-                '#' + CARD_ID + ' .b24c-inline-btn{margin-top:6px;background:#1769f5;color:#fff;border:1px solid #1769f5;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer}',
+                '#' + CARD_ID + ' .b24c-inline-btn{margin-top:4px;background:#1769f5;color:#fff;border:1px solid #1769f5;border-radius:4px;padding:5px 10px;font-size:12px;cursor:pointer;align-self:flex-start}',
                 '#' + CARD_ID + ' .b24c-inline-btn:hover{background:#0758d8}',
+                '@media(max-width:720px){#' + CARD_ID + ' .b24c-grid{grid-template-columns:1fr}}',
                 '#' + MODAL_ID + '{position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(14,25,43,.58);box-sizing:border-box}',
                 '#' + MODAL_ID + ' form{box-sizing:border-box;width:min(620px,100%);max-height:calc(100vh - 36px);overflow:auto;background:#fff;color:#202a35;border-radius:7px;box-shadow:0 16px 48px #0005;font:14px Arial,sans-serif}',
                 '#' + MODAL_ID + ' *{box-sizing:border-box}',
@@ -1559,6 +2229,348 @@ function createPlugin(parent) {
             return a;
         }
 
+        function stopKeyPropagation(el) {
+            ['keydown', 'keypress', 'keyup'].forEach(function (t) {
+                el.addEventListener(t, function (e) { e.stopPropagation(); });
+            });
+        }
+
+        function formatMsgTime(isoStr) {
+            if (!isoStr) return '';
+            try {
+                var d = new Date(isoStr);
+                if (isNaN(d.getTime())) return '';
+                return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } catch (e) {
+                return '';
+            }
+        }
+
+        function mountMiniChat(container, node, profile, initialAuth) {
+            container.replaceChildren();
+            var box = document.createElement('div');
+            box.className = 'b24c-chat-box';
+            container.appendChild(box);
+
+            var dialogId = String(profile.id || '');
+            var currentAuth = initialAuth || { authenticated: false, oauthConfigured: false };
+            activeChatContext = { node: node, dialogId: dialogId, refreshFn: null };
+
+            function renderLoginView(errMsg) {
+                if (chatPollTimer) {
+                    clearInterval(chatPollTimer);
+                    chatPollTimer = null;
+                }
+                box.replaceChildren();
+
+                var head = document.createElement('div');
+                head.className = 'b24c-chat-head';
+                var title = document.createElement('span');
+                title.className = 'b24c-chat-me';
+                title.textContent = 'Мини-чат Битрикс24';
+                head.appendChild(title);
+                box.appendChild(head);
+
+                var hint = document.createElement('div');
+                hint.className = 'b24c-muted';
+                hint.textContent = 'Войдите под своим аккаунтом Битрикс24, чтобы видеть последние сообщения и отвечать от своего имени.';
+                box.appendChild(hint);
+
+                if (errMsg) {
+                    var errDiv = document.createElement('div');
+                    errDiv.className = 'b24c-error';
+                    errDiv.textContent = errMsg;
+                    box.appendChild(errDiv);
+                }
+
+                if (currentAuth && currentAuth.oauthConfigured) {
+                    var oauthBtn = document.createElement('button');
+                    oauthBtn.type = 'button';
+                    oauthBtn.className = 'b24c-inline-btn';
+                    oauthBtn.textContent = 'Войти через Битрикс24';
+                    oauthBtn.onclick = function () {
+                        oauthBtn.disabled = true;
+                        sendPluginAction('startOAuth', { origin: window.location.origin }, pendingChat)
+                            .then(function (res) {
+                                oauthBtn.disabled = false;
+                                if (!res || !res.ok || !res.authorizeUrl) {
+                                    renderLoginView((res && res.error) || 'Не удалось начать вход');
+                                    return;
+                                }
+                                var popup = window.open(res.authorizeUrl, 'b24contacts_oauth', 'width=540,height=660');
+                                if (!popup) {
+                                    renderLoginView('Браузер заблокировал всплывающее окно. Разрешите pop-up для этого сайта.');
+                                    return;
+                                }
+                                var checkTimer = setInterval(function () {
+                                    if (popup.closed) {
+                                        clearInterval(checkTimer);
+                                        sendPluginAction('getChatAuth', {}, pendingChat).then(function (authRes) {
+                                            if (authRes && authRes.auth && authRes.auth.authenticated) {
+                                                currentAuth = authRes.auth;
+                                                renderChatView();
+                                            }
+                                        }).catch(function () {});
+                                    }
+                                }, 500);
+                            })
+                            .catch(function (err) {
+                                oauthBtn.disabled = false;
+                                renderLoginView(err && err.message);
+                            });
+                    };
+                    box.appendChild(oauthBtn);
+                } else {
+                    var noOAuthNote = document.createElement('div');
+                    noOAuthNote.className = 'b24c-muted';
+                    noOAuthNote.textContent = 'OAuth-вход не настроен администратором — можно войти по своему личному вебхуку Битрикс24 (права: user, im):';
+                    box.appendChild(noOAuthNote);
+                }
+
+                var altWrap = document.createElement('div');
+                altWrap.className = 'b24c-chat-alt';
+                var altToggle = document.createElement('button');
+                altToggle.type = 'button';
+                altToggle.className = 'b24c-chat-btn-link';
+                altToggle.style.textAlign = 'left';
+                altToggle.style.padding = '0';
+                altToggle.textContent = (currentAuth && currentAuth.oauthConfigured)
+                    ? 'Или войти по личному вебхуку'
+                    : 'Указать личный вебхук';
+
+                var hookForm = document.createElement('form');
+                hookForm.className = 'b24c-chat-form';
+                hookForm.style.display = (currentAuth && currentAuth.oauthConfigured) ? 'none' : 'flex';
+                var hookInput = document.createElement('input');
+                hookInput.type = 'password';
+                hookInput.className = 'b24c-chat-input';
+                hookInput.placeholder = 'https://.../rest/ID/токен/';
+                hookInput.autocomplete = 'off';
+                stopKeyPropagation(hookInput);
+                var hookSave = document.createElement('button');
+                hookSave.type = 'submit';
+                hookSave.className = 'b24c-chat-send';
+                hookSave.textContent = 'Войти';
+                hookForm.appendChild(hookInput);
+                hookForm.appendChild(hookSave);
+
+                altToggle.onclick = function () {
+                    hookForm.style.display = hookForm.style.display === 'none' ? 'flex' : 'none';
+                };
+                hookForm.onsubmit = function (e) {
+                    e.preventDefault();
+                    var val = hookInput.value.trim();
+                    if (!val) return;
+                    hookSave.disabled = true;
+                    sendPluginAction('savePersonalWebhook', { webhookUrl: val }, pendingChat)
+                        .then(function (res) {
+                            hookSave.disabled = false;
+                            if (!res || !res.ok || !res.auth || !res.auth.authenticated) {
+                                renderLoginView((res && res.error) || 'Не удалось проверить личный вебхук');
+                                return;
+                            }
+                            currentAuth = res.auth;
+                            responseCache.clear();
+                            renderChatView();
+                        })
+                        .catch(function (err) {
+                            hookSave.disabled = false;
+                            renderLoginView(err && err.message);
+                        });
+                };
+
+                altWrap.appendChild(altToggle);
+                altWrap.appendChild(hookForm);
+                box.appendChild(altWrap);
+            }
+
+            function renderChatView() {
+                box.replaceChildren();
+
+                var head = document.createElement('div');
+                head.className = 'b24c-chat-head';
+                var meLabel = document.createElement('span');
+                meLabel.className = 'b24c-chat-me';
+                meLabel.textContent = 'Чат · ' + (currentAuth.b24UserName || 'Битрикс24');
+
+                var btns = document.createElement('div');
+                btns.className = 'b24c-chat-head-btns';
+
+                var syncBtn = document.createElement('button');
+                syncBtn.type = 'button';
+                syncBtn.className = 'b24c-chat-btn-link';
+                syncBtn.title = 'Обновить сообщения';
+                syncBtn.textContent = '↻';
+
+                var logoutBtn = document.createElement('button');
+                logoutBtn.type = 'button';
+                logoutBtn.className = 'b24c-chat-btn-link';
+                logoutBtn.textContent = 'Выйти';
+                logoutBtn.onclick = function () {
+                    sendPluginAction('logoutChat', {}, pendingChat)
+                        .then(function (res) {
+                            currentAuth = (res && res.auth) || { authenticated: false, oauthConfigured: currentAuth.oauthConfigured };
+                            responseCache.clear();
+                            renderLoginView();
+                        })
+                        .catch(function () { renderLoginView(); });
+                };
+
+                btns.appendChild(syncBtn);
+                btns.appendChild(logoutBtn);
+                head.appendChild(meLabel);
+                head.appendChild(btns);
+
+                var msgsBox = document.createElement('div');
+                msgsBox.className = 'b24c-chat-msgs';
+                var loadingTxt = document.createElement('div');
+                loadingTxt.className = 'b24c-muted';
+                loadingTxt.textContent = 'Загрузка сообщений...';
+                msgsBox.appendChild(loadingTxt);
+
+                var sendForm = document.createElement('form');
+                sendForm.className = 'b24c-chat-form';
+                var msgInput = document.createElement('input');
+                msgInput.type = 'text';
+                msgInput.className = 'b24c-chat-input';
+                msgInput.placeholder = 'Сообщение (до 4000 симв.)...';
+                msgInput.maxLength = 4000;
+                stopKeyPropagation(msgInput);
+                var sendBtn = document.createElement('button');
+                sendBtn.type = 'submit';
+                sendBtn.className = 'b24c-chat-send';
+                sendBtn.textContent = 'Отправить';
+                sendForm.appendChild(msgInput);
+                sendForm.appendChild(sendBtn);
+
+                var statusLine = document.createElement('div');
+                statusLine.className = 'b24c-error';
+                statusLine.style.display = 'none';
+
+                box.appendChild(head);
+                box.appendChild(msgsBox);
+                box.appendChild(sendForm);
+                box.appendChild(statusLine);
+
+                function drawMessages(messages) {
+                    msgsBox.replaceChildren();
+                    if (!Array.isArray(messages) || messages.length === 0) {
+                        var empty = document.createElement('div');
+                        empty.className = 'b24c-muted';
+                        empty.textContent = 'Сообщений пока нет — напишите первое';
+                        msgsBox.appendChild(empty);
+                        return;
+                    }
+                    for (var i = 0; i < messages.length; i++) {
+                        var m = messages[i];
+                        var item = document.createElement('div');
+                        item.className = 'b24c-chat-msg' + (m.isMine ? ' mine' : '');
+
+                        var meta = document.createElement('div');
+                        meta.className = 'b24c-chat-meta';
+                        var author = document.createElement('span');
+                        author.textContent = m.isMine ? 'Вы' : (m.authorName || 'Сотрудник');
+                        var tm = document.createElement('span');
+                        tm.textContent = formatMsgTime(m.date);
+                        meta.appendChild(author);
+                        meta.appendChild(tm);
+
+                        var txt = document.createElement('div');
+                        txt.className = 'b24c-chat-text';
+                        txt.textContent = m.text || '';
+
+                        item.appendChild(meta);
+                        item.appendChild(txt);
+                        msgsBox.appendChild(item);
+                    }
+                    msgsBox.scrollTop = msgsBox.scrollHeight;
+                }
+
+                function loadMessages(silent) {
+                    if (!silent) statusLine.style.display = 'none';
+                    sendPluginAction('getChatMessages', { nodeId: node._id || '', dialogId: dialogId, limit: 4 }, pendingChat)
+                        .then(function (res) {
+                            if (!box.parentNode) return;
+                            if (res && res.auth) currentAuth = res.auth;
+                            if (res && res.authRequired) {
+                                renderLoginView(res.error || 'Требуется повторный вход в Битрикс24');
+                                return;
+                            }
+                            if (!res || !res.ok) {
+                                if (!silent) {
+                                    statusLine.textContent = (res && res.error) || 'Не удалось загрузить чат';
+                                    statusLine.style.display = 'block';
+                                }
+                                return;
+                            }
+                            statusLine.style.display = 'none';
+                            drawMessages(res.messages);
+                        })
+                        .catch(function (err) {
+                            if (!silent && box.parentNode) {
+                                statusLine.textContent = err && err.message ? err.message : 'Ошибка загрузки чата';
+                                statusLine.style.display = 'block';
+                            }
+                        });
+                }
+
+                activeChatContext.refreshFn = function () { loadMessages(true); };
+                syncBtn.onclick = function () { loadMessages(false); };
+
+                sendForm.onsubmit = function (e) {
+                    e.preventDefault();
+                    var text = msgInput.value.trim();
+                    if (!text) return;
+                    sendBtn.disabled = true;
+                    msgInput.disabled = true;
+                    statusLine.style.display = 'none';
+
+                    sendPluginAction('sendChatMessage', { nodeId: node._id || '', dialogId: dialogId, message: text }, pendingChat)
+                        .then(function (res) {
+                            sendBtn.disabled = false;
+                            msgInput.disabled = false;
+                            if (res && res.auth) currentAuth = res.auth;
+                            if (res && res.authRequired) {
+                                renderLoginView(res.error || 'Требуется повторный вход в Битрикс24');
+                                return;
+                            }
+                            if (!res || !res.ok) {
+                                statusLine.textContent = (res && res.error) || 'Ошибка отправки';
+                                statusLine.style.display = 'block';
+                                return;
+                            }
+                            msgInput.value = '';
+                            drawMessages(res.messages);
+                            msgInput.focus();
+                        })
+                        .catch(function (err) {
+                            sendBtn.disabled = false;
+                            msgInput.disabled = false;
+                            statusLine.textContent = err && err.message ? err.message : 'Ошибка отправки';
+                            statusLine.style.display = 'block';
+                        });
+                };
+
+                loadMessages(false);
+
+                if (chatPollTimer) clearInterval(chatPollTimer);
+                chatPollTimer = setInterval(function () {
+                    if (!box.parentNode || !isSummaryVisible()) {
+                        clearInterval(chatPollTimer);
+                        chatPollTimer = null;
+                        return;
+                    }
+                    loadMessages(true);
+                }, 15000);
+            }
+
+            if (currentAuth && currentAuth.authenticated) {
+                renderChatView();
+            } else {
+                renderLoginView();
+            }
+        }
+
         function renderResult(node, data) {
             var card = ensureCardElement(node);
             if (!card) return;
@@ -1568,6 +2580,7 @@ function createPlugin(parent) {
             body.replaceChildren();
 
             if (!data || data.ok === false) {
+                if (chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
                 var errEl = document.createElement('div');
                 errEl.className = (data && data.needsConfig) ? 'b24c-muted' : 'b24c-error';
                 errEl.textContent = (data && data.error) ? data.error : 'Не удалось загрузить контакты Битрикс24';
@@ -1585,6 +2598,7 @@ function createPlugin(parent) {
             }
 
             if (!data.matched || !data.profile) {
+                if (chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
                 var emptyEl = document.createElement('div');
                 emptyEl.className = 'b24c-muted';
                 emptyEl.textContent = 'Связанный профиль в Битрикс24 не найден';
@@ -1592,11 +2606,18 @@ function createPlugin(parent) {
                 return;
             }
 
+            var grid = document.createElement('div');
+            grid.className = 'b24c-grid';
+            var infoCol = document.createElement('div');
+            infoCol.className = 'b24c-col-info';
+            var chatCol = document.createElement('div');
+            chatCol.className = 'b24c-col-chat';
+
             if (data.profile.displayName) {
                 var profEl = document.createElement('div');
                 profEl.className = 'b24c-profile';
                 profEl.textContent = data.profile.displayName;
-                body.appendChild(profEl);
+                infoCol.appendChild(profEl);
             }
 
             var phones = Array.isArray(data.phones) ? data.phones : [];
@@ -1604,7 +2625,7 @@ function createPlugin(parent) {
                 var noPhones = document.createElement('div');
                 noPhones.className = 'b24c-muted';
                 noPhones.textContent = 'Профиль найден, но номера телефонов не указаны';
-                body.appendChild(noPhones);
+                infoCol.appendChild(noPhones);
             } else {
                 var list = document.createElement('div');
                 list.className = 'b24c-phones';
@@ -1639,7 +2660,7 @@ function createPlugin(parent) {
                     list.appendChild(row);
                 }
 
-                body.appendChild(list);
+                infoCol.appendChild(list);
             }
 
             var hasChat = isSafeHttpUrl(data.profile.chatUrl);
@@ -1647,9 +2668,18 @@ function createPlugin(parent) {
             if (hasChat || hasProfile) {
                 var linksBar = document.createElement('div');
                 linksBar.className = 'b24c-links';
-                if (hasChat) linksBar.appendChild(createActionLink(data.profile.chatUrl, 'Чат в Битрикс24', 'chat'));
-                if (hasProfile) linksBar.appendChild(createActionLink(data.profile.profileUrl, 'Профиль в Битрикс24', 'user'));
-                body.appendChild(linksBar);
+                if (hasChat) linksBar.appendChild(createActionLink(data.profile.chatUrl, 'Открыть чат', 'chat'));
+                if (hasProfile) linksBar.appendChild(createActionLink(data.profile.profileUrl, 'Профиль', 'user'));
+                infoCol.appendChild(linksBar);
+            }
+
+            grid.appendChild(infoCol);
+            if (data.profile.id) {
+                grid.appendChild(chatCol);
+                body.appendChild(grid);
+                mountMiniChat(chatCol, node, data.profile, data.chatAuth);
+            } else {
+                body.appendChild(infoCol);
             }
         }
 
@@ -1845,7 +2875,45 @@ function createPlugin(parent) {
             testCard.appendChild(testRow);
             testCard.appendChild(testOut);
 
+            var oauthCard = document.createElement('section');
+            oauthCard.className = 'b24c-m-card';
+
+            var oauthTitle = document.createElement('label');
+            oauthTitle.textContent = 'Авторизация сотрудников в мини-чате (OAuth 2.0 Битрикс24)';
+            var oauthHint = document.createElement('p');
+            oauthHint.className = 'b24c-m-note';
+            oauthHint.textContent = 'В Битрикс24 (Разработчикам → Другое → Локальное приложение, права: user, im) укажите Redirect URI: ' + (window.location ? window.location.origin : '') + '/plugin/b24contacts/oauth/callback';
+
+            var clientIdLabel = document.createElement('label');
+            clientIdLabel.textContent = 'OAuth Client ID (код приложения)';
+            var clientIdInput = document.createElement('input');
+            clientIdInput.type = 'text';
+            clientIdInput.name = 'oauthClientId';
+            clientIdInput.placeholder = 'local.xxxxxxxxxx.xxxxxxxx';
+            clientIdInput.autocomplete = 'off';
+            clientIdLabel.appendChild(clientIdInput);
+
+            var clientSecretLabel = document.createElement('label');
+            clientSecretLabel.textContent = 'OAuth Client Secret (ключ приложения)';
+            var clientSecretInput = document.createElement('input');
+            clientSecretInput.type = 'password';
+            clientSecretInput.name = 'oauthClientSecret';
+            clientSecretInput.placeholder = 'Оставьте пустым, чтобы не менять';
+            clientSecretInput.autocomplete = 'new-password';
+            clientSecretLabel.appendChild(clientSecretInput);
+
+            var oauthNote = document.createElement('p');
+            oauthNote.className = 'b24c-m-note';
+            oauthNote.textContent = 'OAuth-приложение не настроено (пользователи могут входить по личному вебхуку).';
+
+            oauthCard.appendChild(oauthTitle);
+            oauthCard.appendChild(oauthHint);
+            oauthCard.appendChild(clientIdLabel);
+            oauthCard.appendChild(clientSecretLabel);
+            oauthCard.appendChild(oauthNote);
+
             body.appendChild(connCard);
+            body.appendChild(oauthCard);
             body.appendChild(testCard);
 
             var footer = document.createElement('div');
@@ -1885,6 +2953,10 @@ function createPlugin(parent) {
                 currentWebhookNote.textContent = msg.hasWebhook
                     ? ('Текущий вебхук: ' + msg.maskedWebhookUrl + ' (оставьте поле пустым, чтобы не менять)')
                     : 'Текущий вебхук: не настроен';
+                if (msg.oauthClientId != null) clientIdInput.value = String(msg.oauthClientId);
+                oauthNote.textContent = msg.oauthConfigured
+                    ? 'OAuth-вход через Битрикс24 настроен (ключ сохранён; оставьте поле ключа пустым, чтобы не менять).'
+                    : 'OAuth-приложение не настроено (пользователи могут входить по личному вебхуку).';
                 if (msg.cacheTtlMinutes != null) ttlField.inp.value = String(msg.cacheTtlMinutes);
                 if (msg.minMatchScore != null) scoreField.inp.value = String(msg.minMatchScore);
                 if (msg.requestTimeoutMs != null) timeoutField.inp.value = String(msg.requestTimeoutMs);
@@ -1962,6 +3034,8 @@ function createPlugin(parent) {
                 sendPluginAction('saveSettings', {
                     settings: {
                         webhookUrl: webhookInput.value.trim(),
+                        oauthClientId: clientIdInput.value.trim(),
+                        oauthClientSecret: clientSecretInput.value.trim(),
                         cacheTtlMinutes: Number(ttlField.inp.value),
                         minMatchScore: Number(scoreField.inp.value),
                         requestTimeoutMs: Number(timeoutField.inp.value),
@@ -1972,6 +3046,7 @@ function createPlugin(parent) {
                         setBusy(false);
                         applyState(msg);
                         webhookInput.value = '';
+                        clientSecretInput.value = '';
                         configRevision++;
                         responseCache.clear();
                         if (window.currentNode) loadContactsForNode(window.currentNode, true);
@@ -2067,6 +3142,15 @@ function createPlugin(parent) {
                     entry.resolve(message);
                 }
             },
+            onChatResult: function (message) {
+                if (!message || typeof message !== 'object') return;
+                var reqId = message.requestId;
+                if (reqId && pendingChat.has(reqId)) {
+                    var entry = pendingChat.get(reqId);
+                    pendingChat.delete(reqId);
+                    entry.resolve(message);
+                }
+            },
             openSettings: openSettingsModal,
             refresh: function () {
                 if (window.currentNode) {
@@ -2098,6 +3182,13 @@ function createPlugin(parent) {
         var payload = (message && typeof message === 'object') ? message : server;
         if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.onSettingsResult === 'function') {
             window.B24ContactsPlugin.onSettingsResult(payload);
+        }
+    };
+
+    obj.onChatResult = function (server, message) {
+        var payload = (message && typeof message === 'object') ? message : server;
+        if (window.B24ContactsPlugin && typeof window.B24ContactsPlugin.onChatResult === 'function') {
+            window.B24ContactsPlugin.onChatResult(payload);
         }
     };
 

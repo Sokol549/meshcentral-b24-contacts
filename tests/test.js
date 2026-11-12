@@ -202,6 +202,7 @@ function testPrepExportsCompatibility() {
         setTimeout,
         clearTimeout,
         setInterval: () => ({ unref: () => {} }),
+        clearInterval: () => {},
         Map
     };
     sandbox.window.document = sandbox.document;
@@ -512,6 +513,7 @@ async function testFrontendInlineUi() {
         setTimeout,
         clearTimeout,
         setInterval: () => ({ unref: () => {} }),
+        clearInterval: () => {},
         Map
     };
     sandbox.window.document = sandbox.document;
@@ -529,11 +531,18 @@ async function testFrontendInlineUi() {
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0].pluginaction, 'getContacts');
 
-    // Deliver matched reply with XSS payload
+    // Deliver matched reply with XSS payload + authenticated chatAuth
     sandbox.window.B24ContactsPlugin.onContactsResult({
         requestId: sentMessages[0].requestId,
         ok: true,
         matched: true,
+        chatAuth: {
+            authenticated: true,
+            mode: 'oauth',
+            b24UserId: '77',
+            b24UserName: 'Иван Соколов',
+            oauthConfigured: true
+        },
         profile: {
             id: '101',
             displayName: '<img src=x onerror=alert(1)> ВА | Калининская, ул. Советская 38 - ЮБ',
@@ -552,6 +561,34 @@ async function testFrontendInlineUi() {
     assert.equal(prof.children.length, 0);
     assert.ok(prof.textContent.includes('<img src=x onerror=alert(1)>'));
 
+    // Verify mini-chat column was mounted and requested getChatMessages
+    const chatBox = card.querySelector('.b24c-chat-box');
+    assert.ok(chatBox, 'Mini-chat box should render next to phones');
+    const chatReq = sentMessages.find((m) => m.pluginaction === 'getChatMessages');
+    assert.ok(chatReq, 'Authenticated user should immediately fetch last 4 messages');
+    assert.equal(chatReq.dialogId, '101');
+    assert.equal(chatReq.limit, 4);
+
+    sandbox.window.B24ContactsPlugin.onChatResult({
+        requestId: chatReq.requestId,
+        ok: true,
+        dialogId: '101',
+        messages: [
+            { id: 1, authorId: '101', authorName: 'Аптека', isMine: false, date: '2026-11-12T08:00:00Z', text: 'Касса не печатает' },
+            { id: 2, authorId: '77', authorName: 'Иван Соколов', isMine: true, date: '2026-11-12T08:05:00Z', text: 'Подключаюсь' }
+        ]
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    const renderedMsgs = [];
+    const mStack = [...chatBox.children];
+    while (mStack.length) {
+        const n = mStack.shift();
+        if (n.className && n.className.split(/\s+/).includes('b24c-chat-msg')) renderedMsgs.push(n);
+        mStack.push(...n.children);
+    }
+    assert.equal(renderedMsgs.length, 2);
+    assert.ok(renderedMsgs[1].className.includes('mine'));
+
     const links = [];
     const stack = [...card.children];
     while (stack.length) {
@@ -569,8 +606,9 @@ async function testFrontendInlineUi() {
     // Switch to needsConfig response -> shows setup button for admin
     windowObj.currentNode = { _id: 'node//2', name: 'ПК 2' };
     sandbox.window.B24ContactsPlugin.onDeviceRefreshEnd();
+    const getContacts2 = sentMessages.filter((m) => m.pluginaction === 'getContacts')[1];
     sandbox.window.B24ContactsPlugin.onContactsResult({
-        requestId: sentMessages[1].requestId,
+        requestId: getContacts2.requestId,
         ok: false,
         needsConfig: true,
         matched: false,
@@ -582,8 +620,9 @@ async function testFrontendInlineUi() {
     // Switch to unmatched device
     windowObj.currentNode = { _id: 'node//3', name: 'Неизвестный ПК' };
     sandbox.window.B24ContactsPlugin.onDeviceRefreshEnd();
+    const getContacts3 = sentMessages.filter((m) => m.pluginaction === 'getContacts')[2];
     sandbox.window.B24ContactsPlugin.onContactsResult({
-        requestId: sentMessages[2].requestId,
+        requestId: getContacts3.requestId,
         ok: true,
         matched: false,
         profile: null,
@@ -595,6 +634,147 @@ async function testFrontendInlineUi() {
     assert.equal(muted.textContent, 'Связанный профиль в Битрикс24 не найден');
 }
 
+async function testPerUserOAuthAndMiniChat() {
+    const messagesDb = [
+        { id: 10, author_id: 3, date: '2026-11-12T08:00:00+03:00', text: '[B]Доброе утро[/B]' },
+        { id: 11, author_id: 77, date: '2026-11-12T08:01:00+03:00', text: 'Проверяю кассу' }
+    ];
+    let currentAccessToken = 'tok_v1';
+
+    const server = http.createServer((req, res) => {
+        let raw = '';
+        req.on('data', (c) => { raw += c; });
+        req.on('end', () => {
+            res.setHeader('Content-Type', 'application/json');
+            if (req.url === '/oauth/token/') {
+                const form = new URLSearchParams(raw);
+                assert.equal(form.get('client_id'), 'local.app.1');
+                assert.equal(form.get('client_secret'), 'sec_123');
+                if (form.get('grant_type') === 'authorization_code') {
+                    assert.equal(form.get('code'), 'auth_code_1');
+                    res.end(JSON.stringify({ access_token: 'tok_v1', refresh_token: 'ref_1', expires_in: 3600 }));
+                } else {
+                    assert.equal(form.get('refresh_token'), 'ref_1');
+                    currentAccessToken = 'tok_v2';
+                    res.end(JSON.stringify({ access_token: 'tok_v2', refresh_token: 'ref_2', expires_in: 3600 }));
+                }
+                return;
+            }
+            const parsed = JSON.parse(raw || '{}');
+            if (req.url === '/rest/user.current.json') {
+                assert.equal(parsed.auth, currentAccessToken);
+                res.end(JSON.stringify({ result: { ID: '77', NAME: 'Иван', LAST_NAME: 'Соколов' } }));
+                return;
+            }
+            if (req.url === '/rest/im.dialog.messages.get.json') {
+                if (parsed.auth === 'tok_expired') {
+                    res.statusCode = 401;
+                    res.end(JSON.stringify({ error: 'expired_token', error_description: 'Token expired' }));
+                    return;
+                }
+                assert.equal(parsed.auth, currentAccessToken);
+                assert.equal(parsed.DIALOG_ID, '3');
+                res.end(JSON.stringify({
+                    result: {
+                        messages: messagesDb.slice(-4).reverse(),
+                        users: [{ id: 3, name: 'Аптека Динская' }, { id: 77, name: 'Иван Соколов' }]
+                    }
+                }));
+                return;
+            }
+            if (req.url === '/rest/im.message.add.json') {
+                if (parsed.auth === 'tok_expired') {
+                    res.statusCode = 401;
+                    res.end(JSON.stringify({ error: 'expired_token', error_description: 'Token expired' }));
+                    return;
+                }
+                assert.equal(parsed.auth, currentAccessToken);
+                assert.equal(parsed.DIALOG_ID, '3');
+                messagesDb.push({ id: messagesDb.length + 20, author_id: 77, date: '2026-11-12T08:02:00+03:00', text: parsed.MESSAGE });
+                res.end(JSON.stringify({ result: 999 }));
+                return;
+            }
+            res.statusCode = 404;
+            res.end(JSON.stringify({ error: 'UNKNOWN' }));
+        });
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const tmpDatapath = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-b24-chat-'));
+
+    try {
+        const base = 'http://127.0.0.1:' + port;
+        const plugin = pluginFactory(createMockParent({
+            settings: {
+                plugins: {
+                    enabled: true,
+                    b24contacts: {
+                        portalUrl: base,
+                        oauthClientId: 'local.app.1',
+                        oauthClientSecret: 'sec_123'
+                    }
+                }
+            }
+        }, tmpDatapath));
+
+        const u1 = { user: { _id: 'user//u1', siteadmin: 0 }, send: () => {} };
+        const u2 = { user: { _id: 'user//u2', siteadmin: 0 }, send: () => {} };
+
+        // User 1 starts OAuth
+        const startRes = await new Promise((resolve) => {
+            plugin.serveraction({ pluginaction: 'startOAuth', requestId: 'c1', origin: 'https://mc.kzvs.pro' }, { user: u1.user, send: resolve });
+        });
+        assert.equal(startRes.ok, true);
+        const authUrl = new URL(startRes.authorizeUrl);
+        assert.equal(authUrl.pathname, '/oauth/authorize/');
+        const state = authUrl.searchParams.get('state');
+
+        // OAuth callback saves encrypted token only for u1
+        const cb = await plugin._internal.completeOAuthCallback('auth_code_1', state);
+        assert.equal(cb.userId, 'user//u1');
+        assert.equal(cb.auth.authenticated, true);
+        assert.equal(cb.auth.b24UserName, 'Иван Соколов');
+
+        // User 2 MUST remain unauthenticated
+        const u2Auth = await new Promise((resolve) => {
+            plugin.serveraction({ pluginaction: 'getChatAuth', requestId: 'c2' }, { user: u2.user, send: resolve });
+        });
+        assert.equal(u2Auth.auth.authenticated, false);
+
+        // User 1 fetches messages (strips BB-code, sorted chronologically)
+        const msgs1 = await new Promise((resolve) => {
+            plugin.serveraction({ pluginaction: 'getChatMessages', requestId: 'c3', dialogId: '3', limit: 4 }, { user: u1.user, send: resolve });
+        });
+        assert.equal(msgs1.ok, true);
+        assert.equal(msgs1.messages.length, 2);
+        assert.equal(msgs1.messages[0].text, 'Доброе утро');
+        assert.equal(msgs1.messages[0].isMine, false);
+        assert.equal(msgs1.messages[1].isMine, true);
+
+        // Simulate expired accessToken -> plugin refreshes token automatically using refresh_token
+        const stored = plugin._internal.readUserChatAuth({ datapath: tmpDatapath }, 'user//u1');
+        stored.accessToken = 'tok_expired';
+        plugin._internal.writeUserChatAuth({ datapath: tmpDatapath }, 'user//u1', stored);
+
+        const sent = await new Promise((resolve) => {
+            plugin.serveraction({ pluginaction: 'sendChatMessage', requestId: 'c4', dialogId: '3', message: 'Готово!' }, { user: u1.user, send: resolve });
+        });
+        assert.equal(sent.ok, true);
+        assert.equal(sent.sent, true);
+        assert.equal(sent.messages[sent.messages.length - 1].text, 'Готово!');
+
+        // Logout clears u1 session
+        const out = await new Promise((resolve) => {
+            plugin.serveraction({ pluginaction: 'logoutChat', requestId: 'c5' }, { user: u1.user, send: resolve });
+        });
+        assert.equal(out.auth.authenticated, false);
+    } finally {
+        fs.rmSync(tmpDatapath, { recursive: true, force: true });
+        await new Promise((resolve) => server.close(resolve));
+    }
+}
+
 async function main() {
     testManifest();
     testPrepExportsCompatibility();
@@ -602,6 +782,7 @@ async function main() {
     testRealMeshCentralPluginHandler();
     await testBitrixPaginationSettingsAndResilience();
     await testFrontendInlineUi();
+    await testPerUserOAuthAndMiniChat();
     console.log('All b24contacts tests passed!');
 }
 
