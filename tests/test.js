@@ -49,9 +49,27 @@ function makeDomShim() {
             attributes: {},
             setAttribute: function (k, v) { this.attributes[k] = String(v); if (k === 'id') this.id = String(v); },
             addEventListener: function () {},
+            get firstChild() { return this.children[0] || null; },
+            get nextSibling() {
+                if (!this.parentNode) return null;
+                const idx = this.parentNode.children.indexOf(this);
+                return idx >= 0 ? (this.parentNode.children[idx + 1] || null) : null;
+            },
             appendChild: function (child) {
                 child.parentNode = this;
                 this.children.push(child);
+                return child;
+            },
+            insertBefore: function (child, refNode) {
+                if (child.parentNode) child.remove();
+                child.parentNode = this;
+                if (!refNode) {
+                    this.children.push(child);
+                    return child;
+                }
+                const idx = this.children.indexOf(refNode);
+                if (idx === -1) this.children.push(child);
+                else this.children.splice(idx, 0, child);
                 return child;
             },
             replaceChildren: function () {
@@ -69,12 +87,15 @@ function makeDomShim() {
                     if (p2a) return p2a.children.find((c) => c.tagName === 'P' && c.className === 'mL') || null;
                     return null;
                 }
-                const cls = sel.startsWith('.') ? sel.slice(1) : null;
+                const parts = sel.split(',').map((s) => s.trim()).filter(Boolean);
                 const stack = [...this.children];
                 while (stack.length) {
                     const node = stack.shift();
-                    if (cls && node.className.split(/\s+/).includes(cls)) return node;
-                    if (!cls && node.tagName.toLowerCase() === sel.toLowerCase()) return node;
+                    for (const part of parts) {
+                        if (part.startsWith('#') && node.id === part.slice(1)) return node;
+                        if (part.startsWith('.') && node.className.split(/\s+/).includes(part.slice(1))) return node;
+                        if (!part.startsWith('#') && !part.startsWith('.') && node.tagName.toLowerCase() === part.toLowerCase()) return node;
+                    }
                     stack.push(...node.children);
                 }
                 return null;
@@ -99,6 +120,14 @@ function makeDomShim() {
     p10.style.display = '';
     const p10info = makeElement('div');
     p10info.id = 'p10info';
+    const zabbixBtn = makeElement('button');
+    zabbixBtn.id = 'zabbix-open';
+    const summaryTable = makeElement('table');
+    const powerChart = makeElement('div');
+    powerChart.id = 'p10html2';
+    p10info.appendChild(zabbixBtn);
+    p10info.appendChild(summaryTable);
+    p10info.appendChild(powerChart);
     p10.appendChild(p10info);
 
     const p2AccountActions = makeElement('div');
@@ -489,6 +518,9 @@ async function testFrontendInlineUi() {
 
     const card = dom.findById(dom.p10, 'b24-contacts-card');
     assert.ok(card, 'Card should be mounted in #p10info');
+    assert.equal(dom.p10info.children[0].id, 'zabbix-open');
+    assert.equal(dom.p10info.children[1].id, 'b24-contacts-card', 'Card should appear right before Summary table, not at bottom');
+    assert.equal(dom.p10info.children[2].tagName, 'TABLE');
     assert.ok(card.querySelector('.b24c-spinner'), 'Spinner should render while loading');
     assert.ok(card.querySelector('.b24c-cfg-btn'), 'Admin settings gear button should render in card');
     assert.equal(sentMessages.length, 1);

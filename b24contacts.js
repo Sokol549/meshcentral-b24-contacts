@@ -1235,6 +1235,7 @@ function createPlugin(parent) {
         var pendingSettings = new Map();
         var responseCache = new Map();
         var requestSeq = 0;
+        var configRevision = 0;
 
         function isCurrentUserAdmin() {
             var u = window.userinfo;
@@ -1371,6 +1372,30 @@ function createPlugin(parent) {
             host.appendChild(wrap);
         }
 
+        function placeCardInContainer(container, card) {
+            var anchor = container.querySelector('table, #p10html');
+            while (anchor && anchor.parentNode && anchor.parentNode !== container) {
+                anchor = anchor.parentNode;
+            }
+            if (anchor && anchor.parentNode === container) {
+                container.insertBefore(card, anchor);
+                return;
+            }
+            var lastBtn = null;
+            var children = container.children || [];
+            for (var i = 0; i < children.length; i++) {
+                var ch = children[i];
+                if (ch !== card && (ch.id === 'zabbix-open' || ch.id === 'restic-open' || ch.tagName === 'BUTTON')) {
+                    lastBtn = ch;
+                }
+            }
+            if (lastBtn) {
+                container.insertBefore(card, lastBtn.nextSibling || null);
+            } else {
+                container.insertBefore(card, container.firstChild || null);
+            }
+        }
+
         function ensureCardElement(node) {
             injectStyles();
             var container = getTargetContainer();
@@ -1425,12 +1450,13 @@ function createPlugin(parent) {
 
                 card.appendChild(header);
                 card.appendChild(body);
-                container.appendChild(card);
+                placeCardInContainer(container, card);
             }
 
             if (node) {
                 card.dataset.nodeId = node._id || '';
                 card.dataset.nodeName = node.name || '';
+                card.dataset.configRev = String(configRevision);
             }
             return card;
         }
@@ -1595,7 +1621,7 @@ function createPlugin(parent) {
             var key = node._id + '|' + nodeName;
             var existingCard = document.getElementById(CARD_ID);
 
-            if (!forceRefresh && existingCard && existingCard.dataset.nodeId === (node._id || '') && existingCard.dataset.nodeName === nodeName) {
+            if (!forceRefresh && existingCard && existingCard.dataset.nodeId === (node._id || '') && existingCard.dataset.nodeName === nodeName && existingCard.dataset.configRev === String(configRevision)) {
                 return;
             }
 
@@ -1807,6 +1833,7 @@ function createPlugin(parent) {
                     .then(function (msg) {
                         setBusy(false);
                         applyState(msg);
+                        configRevision++;
                         responseCache.clear();
                         if (window.currentNode) loadContactsForNode(window.currentNode, true);
                         status.textContent = msg.ok
@@ -1871,6 +1898,7 @@ function createPlugin(parent) {
                         setBusy(false);
                         applyState(msg);
                         webhookInput.value = '';
+                        configRevision++;
                         responseCache.clear();
                         if (window.currentNode) loadContactsForNode(window.currentNode, true);
                         if (msg.saved && msg.ok) {
@@ -1928,7 +1956,7 @@ function createPlugin(parent) {
                         if (!window.currentNode || !isSummaryVisible()) return;
                         var card = document.getElementById(CARD_ID);
                         var activeName = typeof window.currentNode.name === 'string' ? window.currentNode.name : '';
-                        if (!card || card.dataset.nodeId !== (window.currentNode._id || '') || card.dataset.nodeName !== activeName) {
+                        if (!card || card.dataset.nodeId !== (window.currentNode._id || '') || card.dataset.nodeName !== activeName || card.dataset.configRev !== String(configRevision)) {
                             handleRefresh();
                         }
                     }, 80);

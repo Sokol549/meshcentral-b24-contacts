@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2
+- Placed the contacts card at the top of `#p10info` (immediately above the Summary table / below action buttons) instead of the bottom below graphs.
+- Fixed stale card state when returning to a device Summary tab after configuring the Bitrix24 webhook from My Account.
+
+## 1.1.1
+- Normalized sample method suffixes (e.g. `/profile.json`) when pasting URLs from Bitrix24's webhook request generator.
+
 ## 1.1.0
 - Moved all frontend UI directly into `onWebUIStartupEnd` so the plugin works immediately without depending on extra `/plugin/...` HTTP static script routes.
 - Added **Настройка Битрикс24 (Контакты)** link in **Моя учетная запись → Действия учетной записи** (`#p2AccountActions`) and quick `⚙` setup button in the Device Summary card.
