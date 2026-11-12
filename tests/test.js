@@ -44,6 +44,9 @@ function makeDomShim() {
             disabled: false,
             style: {},
             dataset: {},
+            scrollTop: 0,
+            clientHeight: 200,
+            get scrollHeight() { return this.children.length * 60; },
             children: [],
             parentNode: null,
             attributes: {},
@@ -1107,6 +1110,13 @@ async function testLeftbarChatsTabAndUnreadHighlighting() {
         { ID: '101', ACTIVE: true, NAME: 'ВА | Калининская ул. Советская 38 - ЮБ', WORK_PHONE: '+78616321000' }
     ];
     let unreadCounts = { '101': 2, '202': 1, 'chat55': 3 };
+    const threadMsgs = [
+        { id: 495, author_id: 101, date: '2026-11-12T09:50:00+03:00', text: 'Старое сообщение 1' },
+        { id: 496, author_id: 77, date: '2026-11-12T09:52:00+03:00', text: 'Старое сообщение 2' },
+        { id: 497, author_id: 101, date: '2026-11-12T09:55:00+03:00', text: 'Старое сообщение 3' },
+        { id: 498, author_id: 101, date: '2026-11-12T09:58:00+03:00', text: 'Старое сообщение 4' },
+        { id: 501, author_id: 101, date: '2026-11-12T10:01:00+03:00', text: 'Не печатает чек' }
+    ];
     const readCalls = [];
 
     const server = http.createServer((req, res) => {
@@ -1157,10 +1167,20 @@ async function testLeftbarChatsTabAndUnreadHighlighting() {
             if (req.url.endsWith('/im.dialog.messages.get.json')) {
                 res.end(JSON.stringify({
                     result: {
-                        messages: [{ id: 501, author_id: 101, date: '2026-11-12T10:01:00+03:00', text: 'Не печатает чек' }],
-                        users: [{ id: 101, name: 'ВА | Калининская ул. Советская 38 - ЮБ' }]
+                        messages: threadMsgs.slice().reverse(),
+                        users: [{ id: 101, name: 'ВА | Калининская ул. Советская 38 - ЮБ' }, { id: 77, name: 'Иван Соколов' }]
                     }
                 }));
+                return;
+            }
+            if (req.url.endsWith('/im.message.add.json')) {
+                threadMsgs.push({
+                    id: 502 + threadMsgs.length,
+                    author_id: 77,
+                    date: '2026-11-12T10:05:00+03:00',
+                    text: parsed.MESSAGE
+                });
+                res.end(JSON.stringify({ result: 502 + threadMsgs.length }));
                 return;
             }
             if (req.url.endsWith('/im.dialog.read.json')) {
@@ -1332,6 +1352,26 @@ async function testLeftbarChatsTabAndUnreadHighlighting() {
         assert.ok(readCalls.includes('101'), 'Opening chat must automatically call im.dialog.read');
         assert.equal(leftBadge.textContent, '4', 'Leftbar unread badge should decrease after reading dialog 101');
         assert.ok(!kalinRow.row.classList.contains('b24c-dev-unread'), 'PC highlight should clear after reading dialog 101');
+
+        // Verify thread scrolled to newest message (bottom), NOT stuck at 0 (oldest)
+        const msgsBox = chatsPage.querySelector('.b24c-thread-msgs');
+        assert.equal(msgsBox.scrollTop, msgsBox.scrollHeight, 'Thread should auto-scroll to newest messages at bottom');
+
+        // Type draft & simulate background refresh -> textarea DOM element & draft MUST be preserved
+        const textarea = chatsPage.querySelector('.b24c-thread-input');
+        const sendForm = chatsPage.querySelector('.b24c-thread-form');
+        assert.ok(textarea && sendForm);
+        textarea.value = 'Иду проверять фискальник';
+        await sandbox.window.B24ContactsPlugin.refreshOverview(true);
+        assert.equal(chatsPage.querySelector('.b24c-thread-input'), textarea, 'Textarea must NOT be recreated during background refresh');
+        assert.equal(textarea.value, 'Иду проверять фискальник', 'Typed draft must survive background refresh');
+
+        // Send reply via form submit -> appends message, clears draft, stays scrolled to bottom
+        sendForm.onsubmit({ preventDefault: () => {} });
+        await new Promise((r) => setTimeout(r, 30));
+        assert.equal(textarea.value, '', 'Textarea should clear after sending reply');
+        assert.ok(threadMsgs.some((m) => m.text === 'Иду проверять фискальник'), 'Reply must be sent to Bitrix24');
+        assert.equal(msgsBox.scrollTop, msgsBox.scrollHeight, 'Thread should stay scrolled to newest message after sending');
 
         // Switching back via MeshCentral goPageStart hides chats page
         sandbox.window.B24ContactsPlugin.goPageStart(1);

@@ -1649,7 +1649,7 @@ function createPlugin(parent) {
         }
     }
 
-    var ROUTES_VERSION = '1.5.0';
+    var ROUTES_VERSION = '1.5.1';
 
     function getExpressApps() {
         var server = getServer();
@@ -2694,7 +2694,7 @@ function createPlugin(parent) {
                 '.b24c-dev-icon-unread{position:relative !important;outline:2px solid #ef4444 !important;outline-offset:1px;border-radius:5px !important;box-shadow:0 0 8px rgba(239,68,68,0.55) !important;animation:b24c-pulse 1.8s ease-in-out infinite}',
                 '.b24c-dev-msg-badge{display:inline-flex;align-items:center;gap:3px;margin-left:6px;padding:1px 6px;border-radius:10px;background:#ef4444;color:#fff;font:700 11px/15px Arial,sans-serif;cursor:pointer;vertical-align:middle;box-shadow:0 1px 3px rgba(0,0,0,0.2);text-decoration:none}',
                 '.b24c-dev-msg-badge:hover{background:#dc2626}',
-                '#' + CHATS_PAGE_ID + '{display:none;padding:10px 14px;box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;color:#0f172a;height:calc(100vh - 86px);min-height:480px;flex-direction:column;gap:10px}',
+                '#' + CHATS_PAGE_ID + '{display:none;padding:10px 14px;box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;color:#0f172a;height:calc(100vh - 140px);max-height:calc(100vh - 110px);min-height:440px;flex-direction:column;gap:10px}',
                 '#' + CHATS_PAGE_ID + '.visible{display:flex}',
                 '#' + CHATS_PAGE_ID + ' *{box-sizing:border-box}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:#fff;border:1px solid #d5dce6;border-radius:6px;flex-shrink:0;flex-wrap:wrap}',
@@ -2705,7 +2705,7 @@ function createPlugin(parent) {
                 '#' + CHATS_PAGE_ID + ' .b24c-p-login{max-width:460px;background:#fff;border:1px solid #d5dce6;border-radius:6px;padding:18px;display:flex;flex-direction:column;gap:10px}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-layout{flex:1;min-height:0;display:grid;grid-template-columns:320px 1fr;gap:10px}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-sidebar{background:#fff;border:1px solid #d5dce6;border-radius:6px;display:flex;flex-direction:column;min-height:0;overflow:hidden}',
-                '#' + CHATS_PAGE_ID + ' .b24c-p-controls{padding:8px;border-bottom:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px}',
+                '#' + CHATS_PAGE_ID + ' .b24c-p-controls{padding:8px;border-bottom:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px;flex-shrink:0}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-search{width:100%;height:30px;padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font:12px Arial,sans-serif}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-tabs{display:flex;gap:6px}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-tab{flex:1;padding:4px 8px;font-size:11px;font-weight:600;border:1px solid #cbd5e1;border-radius:4px;background:#f8fafc;color:#475569;cursor:pointer}',
@@ -2725,15 +2725,16 @@ function createPlugin(parent) {
                 '#' + CHATS_PAGE_ID + ' .b24c-tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:#e0f2fe;color:#0369a1;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
                 '#' + CHATS_PAGE_ID + ' .b24c-tag.group{background:#f1f5f9;color:#475569}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-main{background:#fff;border:1px solid #d5dce6;border-radius:6px;display:flex;flex-direction:column;min-height:0;overflow:hidden}',
-                '#' + CHATS_PAGE_ID + ' .b24c-thread-head{padding:10px 14px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:#f8fafc}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-head{padding:10px 14px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:#f8fafc;flex-shrink:0}',
                 '#' + CHATS_PAGE_ID + ' .b24c-thread-title{font-size:15px;font-weight:700;color:#0f172a}',
                 '#' + CHATS_PAGE_ID + ' .b24c-thread-sub{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:4px;font-size:12px}',
                 '#' + CHATS_PAGE_ID + ' .b24c-thread-msgs{flex:1;min-height:0;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:6px;background:#fafcff}',
                 '#' + CHATS_PAGE_ID + ' .b24c-thread-msgs .b24c-chat-msg{max-width:78%;padding:7px 10px;border-radius:6px;font-size:13px;align-self:flex-start;background:#eef2f7}',
                 '#' + CHATS_PAGE_ID + ' .b24c-thread-msgs .b24c-chat-msg.mine{align-self:flex-end;background:#dbeafe}',
-                '#' + CHATS_PAGE_ID + ' .b24c-thread-form{padding:10px 12px;border-top:1px solid #e2e8f0;display:flex;gap:8px;align-items:flex-end;background:#fff}',
-                '#' + CHATS_PAGE_ID + ' .b24c-thread-input{flex:1;min-height:38px;max-height:110px;padding:7px 10px;border:1px solid #cbd5e1;border-radius:4px;font:13px Arial,sans-serif;resize:vertical}',
-                '#' + CHATS_PAGE_ID + ' .b24c-thread-send{height:38px;padding:0 16px;border:1px solid #1769f5;border-radius:4px;background:#1769f5;color:#fff;font-size:13px;font-weight:600;cursor:pointer}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-err{padding:5px 12px;background:#fef2f2;color:#b91c1c;border-top:1px solid #fecaca;font-size:12px;flex-shrink:0;display:none}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-form{padding:10px 12px;border-top:1px solid #e2e8f0;display:flex;gap:8px;align-items:flex-end;background:#fff;flex-shrink:0}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-input{flex:1;min-height:38px;max-height:110px;padding:7px 10px;border:1px solid #cbd5e1;border-radius:4px;font:13px Arial,sans-serif;resize:vertical;color:#0f172a;background:#fff}',
+                '#' + CHATS_PAGE_ID + ' .b24c-thread-send{height:38px;padding:0 16px;border:1px solid #1769f5;border-radius:4px;background:#1769f5;color:#fff;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0}',
                 '#' + CHATS_PAGE_ID + ' .b24c-thread-send:disabled{opacity:0.55;cursor:default}',
                 '#' + CHATS_PAGE_ID + ' .b24c-empty-thread{margin:auto;text-align:center;color:#64748b;font-size:13px;padding:24px}',
                 '@media(max-width:860px){#' + CHATS_PAGE_ID + ' .b24c-p-layout{grid-template-columns:1fr;grid-template-rows:240px 1fr}}',
@@ -3100,7 +3101,26 @@ function createPlugin(parent) {
             container.appendChild(altWrap);
         }
 
-        function renderMessagesInto(msgsBox, messages, emptyText) {
+        function scrollMsgsToBottom(msgsBox) {
+            if (!msgsBox) return;
+            var apply = function () {
+                try { msgsBox.scrollTop = msgsBox.scrollHeight; } catch (e) {}
+            };
+            apply();
+            if (typeof requestAnimationFrame === 'function') {
+                requestAnimationFrame(apply);
+            }
+            if (typeof setTimeout === 'function') {
+                setTimeout(apply, 20);
+            }
+        }
+
+        function renderMessagesInto(msgsBox, messages, emptyText, forceScrollBottom) {
+            var hadRendered = Boolean(msgsBox.dataset && msgsBox.dataset.b24cHasRendered);
+            var prevScrollTop = msgsBox.scrollTop || 0;
+            var distFromBottom = (msgsBox.scrollHeight || 0) - prevScrollTop - (msgsBox.clientHeight || 0);
+            var wasNearBottom = !hadRendered || distFromBottom <= 50;
+
             msgsBox.replaceChildren();
             if (!Array.isArray(messages) || messages.length === 0) {
                 var empty = document.createElement('div');
@@ -3131,7 +3151,12 @@ function createPlugin(parent) {
                 item.appendChild(txt);
                 msgsBox.appendChild(item);
             }
-            msgsBox.scrollTop = msgsBox.scrollHeight;
+            if (msgsBox.dataset) msgsBox.dataset.b24cHasRendered = '1';
+            if (forceScrollBottom || wasNearBottom) {
+                scrollMsgsToBottom(msgsBox);
+            } else {
+                try { msgsBox.scrollTop = prevScrollTop; } catch (e) {}
+            }
         }
 
         function collectVisibleNodes() {
@@ -3265,7 +3290,7 @@ function createPlugin(parent) {
                 overviewState.unreadDialogsCount = dialogs.length ? dCount : Math.max(0, (overviewState.unreadDialogsCount || 0) - 1);
                 updateLeftbarBadge();
                 highlightUnreadDevices();
-                if (chatsPageState.open) renderChatsPageBody();
+                if (chatsPageState.open) renderChatsPageSidebarList();
             }
         }
 
@@ -3312,6 +3337,18 @@ function createPlugin(parent) {
             return btn;
         }
 
+        function fitChatsPageHeight() {
+            var page = document.getElementById(CHATS_PAGE_ID);
+            if (!page || !chatsPageState.open) return;
+            if (typeof window.innerHeight === 'number' && typeof page.getBoundingClientRect === 'function') {
+                var rect = page.getBoundingClientRect();
+                var top = (rect && typeof rect.top === 'number' && rect.top > 0) ? rect.top : 110;
+                var avail = Math.max(420, window.innerHeight - Math.round(top) - 18);
+                page.style.height = avail + 'px';
+                page.style.maxHeight = avail + 'px';
+            }
+        }
+
         function ensureChatsPageElement() {
             injectStyles();
             var col = document.getElementById('column_l');
@@ -3320,7 +3357,12 @@ function createPlugin(parent) {
             if (!page) {
                 page = document.createElement('div');
                 page.id = CHATS_PAGE_ID;
+                stopKeyPropagation(page);
                 col.appendChild(page);
+                if (typeof window.addEventListener === 'function' && !window._b24cResizeBound) {
+                    window._b24cResizeBound = true;
+                    window.addEventListener('resize', fitChatsPageHeight);
+                }
             }
             return page;
         }
@@ -3349,8 +3391,10 @@ function createPlugin(parent) {
         function loadChatsPageThread(dialogId, silent) {
             if (!dialogId) return;
             chatsPageState.loadingThread = !silent;
-            chatsPageState.threadError = '';
-            if (!silent) renderChatsPageThreadPane();
+            if (!silent) {
+                chatsPageState.threadError = '';
+                renderChatsPageThreadPane(true);
+            }
 
             sendPluginAction('getChatMessages', { dialogId: dialogId, limit: 30, markRead: true }, pendingChat)
                 .then(function (res) {
@@ -3363,25 +3407,31 @@ function createPlugin(parent) {
                         return;
                     }
                     if (!res || !res.ok) {
-                        chatsPageState.threadError = (res && res.error) || 'Не удалось загрузить сообщения';
-                        renderChatsPageThreadPane();
+                        if (!silent) {
+                            chatsPageState.threadError = (res && res.error) || 'Не удалось загрузить сообщения';
+                            renderChatsPageThreadPane(false);
+                        }
                         return;
                     }
+                    chatsPageState.threadError = '';
                     chatsPageState.messages = Array.isArray(res.messages) ? res.messages : [];
                     clearDialogUnreadLocal(dialogId);
-                    renderChatsPageThreadPane();
+                    renderChatsPageThreadPane(!silent);
                 })
                 .catch(function (err) {
                     if (chatsPageState.selectedDialogId !== dialogId) return;
                     chatsPageState.loadingThread = false;
-                    chatsPageState.threadError = err && err.message ? err.message : 'Ошибка загрузки переписки';
-                    renderChatsPageThreadPane();
+                    if (!silent) {
+                        chatsPageState.threadError = err && err.message ? err.message : 'Ошибка загрузки переписки';
+                        renderChatsPageThreadPane(false);
+                    }
                 });
         }
 
         function selectDialogOnPage(dialogId) {
             chatsPageState.selectedDialogId = String(dialogId || '');
             chatsPageState.messages = [];
+            chatsPageState.threadError = '';
             clearDialogUnreadLocal(chatsPageState.selectedDialogId);
             renderChatsPageSidebarList();
             loadChatsPageThread(chatsPageState.selectedDialogId, false);
@@ -3500,16 +3550,17 @@ function createPlugin(parent) {
             }
         }
 
-        function renderChatsPageThreadPane() {
+        function renderChatsPageThreadPane(forceScrollBottom) {
             var page = document.getElementById(CHATS_PAGE_ID);
             if (!page) return;
             var mainPane = page.querySelector('.b24c-p-main');
             if (!mainPane) return;
 
             var dlg = getSelectedDialogObj();
-            mainPane.replaceChildren();
 
             if (!dlg && !chatsPageState.selectedDialogId) {
+                mainPane.dataset.dialogId = '';
+                mainPane.replaceChildren();
                 var placeholder = document.createElement('div');
                 placeholder.className = 'b24c-empty-thread';
                 placeholder.textContent = 'Выберите чат слева, чтобы прочитать сообщения и ответить.';
@@ -3517,7 +3568,43 @@ function createPlugin(parent) {
                 return;
             }
 
-            var activeDialogId = dlg ? dlg.dialogId : chatsPageState.selectedDialogId;
+            var activeDialogId = dlg ? String(dlg.dialogId) : String(chatsPageState.selectedDialogId);
+
+            function syncThreadMessages(msgsBox, errBanner) {
+                if (errBanner) {
+                    if (chatsPageState.threadError) {
+                        errBanner.textContent = chatsPageState.threadError;
+                        errBanner.style.display = 'block';
+                    } else {
+                        errBanner.textContent = '';
+                        errBanner.style.display = 'none';
+                    }
+                }
+                if (!msgsBox) return;
+                if (chatsPageState.loadingThread && chatsPageState.messages.length === 0) {
+                    msgsBox.replaceChildren();
+                    var loadEl = document.createElement('div');
+                    loadEl.className = 'b24c-muted';
+                    loadEl.textContent = 'Загрузка сообщений...';
+                    msgsBox.appendChild(loadEl);
+                    return;
+                }
+                renderMessagesInto(msgsBox, chatsPageState.messages, 'Сообщений пока нет — напишите первое', Boolean(forceScrollBottom));
+            }
+
+            // Preserve the input form, typed draft, and focus when refreshing messages in the same dialog
+            if (mainPane.dataset && mainPane.dataset.dialogId === activeDialogId) {
+                var existingMsgs = typeof mainPane.querySelector === 'function' ? mainPane.querySelector('.b24c-thread-msgs') : null;
+                var existingErr = typeof mainPane.querySelector === 'function' ? mainPane.querySelector('.b24c-thread-err') : null;
+                if (existingMsgs) {
+                    syncThreadMessages(existingMsgs, existingErr);
+                    return;
+                }
+            }
+
+            if (mainPane.dataset) mainPane.dataset.dialogId = activeDialogId;
+            mainPane.replaceChildren();
+
             var head = document.createElement('div');
             head.className = 'b24c-thread-head';
             var headLeft = document.createElement('div');
@@ -3580,19 +3667,9 @@ function createPlugin(parent) {
 
             var msgsBox = document.createElement('div');
             msgsBox.className = 'b24c-thread-msgs';
-            if (chatsPageState.loadingThread && chatsPageState.messages.length === 0) {
-                var loadEl = document.createElement('div');
-                loadEl.className = 'b24c-muted';
-                loadEl.textContent = 'Загрузка сообщений...';
-                msgsBox.appendChild(loadEl);
-            } else if (chatsPageState.threadError) {
-                var errEl = document.createElement('div');
-                errEl.className = 'b24c-error';
-                errEl.textContent = chatsPageState.threadError;
-                msgsBox.appendChild(errEl);
-            } else {
-                renderMessagesInto(msgsBox, chatsPageState.messages, 'Сообщений пока нет — напишите первое');
-            }
+
+            var errBanner = document.createElement('div');
+            errBanner.className = 'b24c-thread-err';
 
             var sendForm = document.createElement('form');
             sendForm.className = 'b24c-thread-form';
@@ -3601,26 +3678,26 @@ function createPlugin(parent) {
             textarea.placeholder = 'Напишите сообщение (Enter — отправить, Shift+Enter — перенос строки)...';
             textarea.maxLength = 4000;
             stopKeyPropagation(textarea);
-            textarea.addEventListener('keydown', function (e) {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    if (typeof sendForm.requestSubmit === 'function') sendForm.requestSubmit();
-                    else sendForm.dispatchEvent(new Event('submit', { cancelable: true }));
-                }
-            });
+
             var sendBtn = document.createElement('button');
             sendBtn.type = 'submit';
             sendBtn.className = 'b24c-thread-send';
             sendBtn.textContent = 'Отправить';
 
-            sendForm.onsubmit = function (e) {
-                e.preventDefault();
+            var sending = false;
+            function submitCurrentMessage() {
+                if (sending) return;
                 var text = textarea.value.trim();
                 if (!text) return;
+                sending = true;
                 sendBtn.disabled = true;
                 textarea.disabled = true;
+                chatsPageState.threadError = '';
+                errBanner.style.display = 'none';
+
                 sendPluginAction('sendChatMessage', { dialogId: activeDialogId, message: text, limit: 30 }, pendingChat)
                     .then(function (res) {
+                        sending = false;
                         sendBtn.disabled = false;
                         textarea.disabled = false;
                         if (res && res.authRequired) {
@@ -3630,30 +3707,51 @@ function createPlugin(parent) {
                         }
                         if (!res || !res.ok) {
                             chatsPageState.threadError = (res && res.error) || 'Не удалось отправить сообщение';
-                            renderChatsPageThreadPane();
+                            errBanner.textContent = chatsPageState.threadError;
+                            errBanner.style.display = 'block';
                             return;
                         }
                         textarea.value = '';
+                        chatsPageState.threadError = '';
                         chatsPageState.messages = Array.isArray(res.messages) ? res.messages : [];
                         clearDialogUnreadLocal(activeDialogId);
-                        renderMessagesInto(msgsBox, chatsPageState.messages);
-                        textarea.focus();
+                        syncThreadMessages(msgsBox, errBanner);
+                        scrollMsgsToBottom(msgsBox);
+                        try { textarea.focus(); } catch (e) {}
                         refreshChatOverview(true);
                     })
                     .catch(function (err) {
+                        sending = false;
                         sendBtn.disabled = false;
                         textarea.disabled = false;
                         chatsPageState.threadError = err && err.message ? err.message : 'Ошибка отправки';
-                        renderChatsPageThreadPane();
+                        errBanner.textContent = chatsPageState.threadError;
+                        errBanner.style.display = 'block';
                     });
+            }
+
+            textarea.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    submitCurrentMessage();
+                }
+            });
+
+            sendForm.onsubmit = function (e) {
+                if (e && e.preventDefault) e.preventDefault();
+                submitCurrentMessage();
             };
 
             sendForm.appendChild(textarea);
             sendForm.appendChild(sendBtn);
 
+            // Attach to DOM BEFORE rendering messages so scrollHeight is real and scrolls to newest
             mainPane.appendChild(head);
             mainPane.appendChild(msgsBox);
+            mainPane.appendChild(errBanner);
             mainPane.appendChild(sendForm);
+
+            syncThreadMessages(msgsBox, errBanner);
         }
 
         function renderChatsPageBody() {
@@ -3830,6 +3928,7 @@ function createPlugin(parent) {
                 chatsPageState.selectedDialogId = String(targetDialogId);
             }
             page.classList.add('visible');
+            fitChatsPageHeight();
             renderChatsPageBody();
             if (targetDialogId && overviewState.authenticated) {
                 selectDialogOnPage(targetDialogId);
@@ -4024,7 +4123,7 @@ function createPlugin(parent) {
                             }
                             statusLine.style.display = 'none';
                             clearDialogUnreadLocal(dialogId);
-                            renderMessagesInto(msgsBox, res.messages);
+                            renderMessagesInto(msgsBox, res.messages, null, !silent);
                         })
                         .catch(function (err) {
                             if (!silent && box.parentNode) {
@@ -4061,7 +4160,7 @@ function createPlugin(parent) {
                             }
                             msgInput.value = '';
                             clearDialogUnreadLocal(dialogId);
-                            renderMessagesInto(msgsBox, res.messages);
+                            renderMessagesInto(msgsBox, res.messages, null, true);
                             msgInput.focus();
                         })
                         .catch(function (err) {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.1
+- Fixed reply input being interrupted/reset in the Chats tab: background refreshes now update only the message feed without recreating the composer `<form>`/`<textarea>`, and dynamic viewport height sizing prevents the reply form from overflowing off-screen.
+- Fixed chat scroll jumping back to the oldest message on refresh: message lists are now mounted to the DOM before scrolling to bottom (`requestAnimationFrame` + immediate scroll), and user scroll position is preserved during background polling if reading older history.
+
 ## 1.5.0
 - Added a full-featured **Bitrix24 Chats** tab in the MeshCentral left sidebar (`#page_leftbar`) displaying all recent Bitrix24 chats (`im.recent.list`) with search, unread filter, full message history, linked PC quick-jump buttons, and unread counter badge.
 - Added unread highlighting for synced computers in the MeshCentral device list (`#xdevices`): device rows and icons glow/highlight with a clickable unread count badge (`💬 N`) when their matched Bitrix24 contact has unread messages (unsynced computers are not highlighted).
