@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.5.2
+- Fixed the Chats tab reply form overlapping/clipping under the MeshCentral bottom bar (`#footer` / lower container edge) by lowering `min-height` to `300px`, reserving bottom bar space (`-48px` / footer boundary detection), and recalculating height after layout.
+
 ## 1.5.1
 - Fixed reply input being interrupted/reset in the Chats tab: background refreshes now update only the message feed without recreating the composer `<form>`/`<textarea>`, and dynamic viewport height sizing prevents the reply form from overflowing off-screen.
 - Fixed chat scroll jumping back to the oldest message on refresh: message lists are now mounted to the DOM before scrolling to bottom (`requestAnimationFrame` + immediate scroll), and user scroll position is preserved during background polling if reading older history.

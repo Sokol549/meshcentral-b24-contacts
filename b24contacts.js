@@ -1649,7 +1649,7 @@ function createPlugin(parent) {
         }
     }
 
-    var ROUTES_VERSION = '1.5.1';
+    var ROUTES_VERSION = '1.5.2';
 
     function getExpressApps() {
         var server = getServer();
@@ -2694,7 +2694,7 @@ function createPlugin(parent) {
                 '.b24c-dev-icon-unread{position:relative !important;outline:2px solid #ef4444 !important;outline-offset:1px;border-radius:5px !important;box-shadow:0 0 8px rgba(239,68,68,0.55) !important;animation:b24c-pulse 1.8s ease-in-out infinite}',
                 '.b24c-dev-msg-badge{display:inline-flex;align-items:center;gap:3px;margin-left:6px;padding:1px 6px;border-radius:10px;background:#ef4444;color:#fff;font:700 11px/15px Arial,sans-serif;cursor:pointer;vertical-align:middle;box-shadow:0 1px 3px rgba(0,0,0,0.2);text-decoration:none}',
                 '.b24c-dev-msg-badge:hover{background:#dc2626}',
-                '#' + CHATS_PAGE_ID + '{display:none;padding:10px 14px;box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;color:#0f172a;height:calc(100vh - 140px);max-height:calc(100vh - 110px);min-height:440px;flex-direction:column;gap:10px}',
+                '#' + CHATS_PAGE_ID + '{display:none;padding:10px 14px 14px;box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;color:#0f172a;height:calc(100vh - 180px);max-height:calc(100vh - 160px);min-height:300px;flex-direction:column;gap:10px}',
                 '#' + CHATS_PAGE_ID + '.visible{display:flex}',
                 '#' + CHATS_PAGE_ID + ' *{box-sizing:border-box}',
                 '#' + CHATS_PAGE_ID + ' .b24c-p-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:#fff;border:1px solid #d5dce6;border-radius:6px;flex-shrink:0;flex-wrap:wrap}',
@@ -3340,13 +3340,27 @@ function createPlugin(parent) {
         function fitChatsPageHeight() {
             var page = document.getElementById(CHATS_PAGE_ID);
             if (!page || !chatsPageState.open) return;
-            if (typeof window.innerHeight === 'number' && typeof page.getBoundingClientRect === 'function') {
-                var rect = page.getBoundingClientRect();
-                var top = (rect && typeof rect.top === 'number' && rect.top > 0) ? rect.top : 110;
-                var avail = Math.max(420, window.innerHeight - Math.round(top) - 18);
-                page.style.height = avail + 'px';
-                page.style.maxHeight = avail + 'px';
+            if (typeof window.innerHeight !== 'number' || typeof page.getBoundingClientRect !== 'function') return;
+            var rect = page.getBoundingClientRect();
+            var top = (rect && typeof rect.top === 'number' && rect.top > 0) ? rect.top : 110;
+            var bottomLimit = window.innerHeight - 48;
+            var col = document.getElementById('column_l');
+            if (col && typeof col.getBoundingClientRect === 'function') {
+                var colRect = col.getBoundingClientRect();
+                if (colRect && colRect.bottom > top + 180 && colRect.bottom < window.innerHeight) {
+                    bottomLimit = Math.min(bottomLimit, colRect.bottom - 12);
+                }
             }
+            var footer = document.getElementById('footer') || document.getElementById('page_footer') || (typeof document.querySelector === 'function' ? document.querySelector('#container > div:last-child') : null);
+            if (footer && footer !== col && (!col || !col.contains || !col.contains(footer)) && typeof footer.getBoundingClientRect === 'function') {
+                var fRect = footer.getBoundingClientRect();
+                if (fRect && fRect.height > 8 && fRect.height < 140 && fRect.top > top + 180) {
+                    bottomLimit = Math.min(bottomLimit, fRect.top - 12);
+                }
+            }
+            var avail = Math.max(300, Math.floor(bottomLimit - top));
+            page.style.height = avail + 'px';
+            page.style.maxHeight = avail + 'px';
         }
 
         function ensureChatsPageElement() {
@@ -3929,6 +3943,8 @@ function createPlugin(parent) {
             }
             page.classList.add('visible');
             fitChatsPageHeight();
+            if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fitChatsPageHeight);
+            if (typeof setTimeout === 'function') setTimeout(fitChatsPageHeight, 30);
             renderChatsPageBody();
             if (targetDialogId && overviewState.authenticated) {
                 selectDialogOnPage(targetDialogId);
