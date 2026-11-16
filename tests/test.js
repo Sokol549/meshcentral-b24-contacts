@@ -629,13 +629,18 @@ async function testFrontendInlineUi() {
     assert.equal(prof.children.length, 0);
     assert.ok(prof.textContent.includes('<img src=x onerror=alert(1)>'));
 
-    // Verify mini-chat column was mounted and requested getChatMessages
+    // Verify mini-chat column was mounted and requested getChatMessages without auto-reading
     const chatBox = card.querySelector('.b24c-chat-box');
     assert.ok(chatBox, 'Mini-chat box should render next to phones');
     const chatReq = sentMessages.find((m) => m.pluginaction === 'getChatMessages');
     assert.ok(chatReq, 'Authenticated user should immediately fetch last 4 messages');
     assert.equal(chatReq.dialogId, '101');
     assert.equal(chatReq.limit, 4);
+    assert.equal(chatReq.markRead, false, 'Mini-chat on device summary must NOT auto-read messages');
+
+    const markReadBtn = chatBox.querySelector('.b24c-chat-btn-read');
+    assert.ok(markReadBtn, 'Header must contain manual mark-read button');
+    assert.ok(markReadBtn.textContent.includes('Прочитать'));
 
     sandbox.window.B24ContactsPlugin.onChatResult({
         requestId: chatReq.requestId,
@@ -647,6 +652,23 @@ async function testFrontendInlineUi() {
         ]
     });
     await new Promise((r) => setTimeout(r, 10));
+
+    // Clicking manual read button sends markChatRead action
+    markReadBtn.onclick();
+    const markReadReq = sentMessages.find((m) => m.pluginaction === 'markChatRead');
+    assert.ok(markReadReq, 'Clicking mark-read button must send markChatRead action');
+    assert.equal(markReadReq.dialogId, '101');
+    assert.equal(markReadReq.lastMessageId, 2);
+
+    sandbox.window.B24ContactsPlugin.onChatResult({
+        requestId: markReadReq.requestId,
+        ok: true,
+        dialogId: '101',
+        markedRead: true
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(markReadBtn.textContent, '✓ Прочитано');
+    assert.equal(markReadBtn.disabled, true);
     const renderedMsgs = [];
     const mStack = [...chatBox.children];
     while (mStack.length) {

@@ -1649,7 +1649,7 @@ function createPlugin(parent) {
         }
     }
 
-    var ROUTES_VERSION = '1.5.2';
+    var ROUTES_VERSION = '1.5.3';
 
     function getExpressApps() {
         var server = getServer();
@@ -2385,9 +2385,12 @@ function createPlugin(parent) {
         }
 
         if (action === 'markChatRead') {
-            var readDialogId = typeof command.dialogId === 'string' ? command.dialogId : '';
+            var readDialogId = (command.dialogId != null) ? String(command.dialogId).trim() : '';
+            var markNodeId = typeof command.nodeId === 'string' ? command.nodeId : '';
             (async function () {
                 try {
+                    var hasAccess = await verifyNodeAccess(client, markNodeId);
+                    if (!hasAccess) throw new Error('Доступ к устройству запрещён');
                     await markDialogReadForUser(client.user._id, readDialogId, command.lastMessageId);
                     sendToClient(client, {
                         action: 'plugin',
@@ -2631,6 +2634,12 @@ function createPlugin(parent) {
                 '#' + CARD_ID + ' .b24c-chat-head{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;color:#475569;border-bottom:1px solid #edf2f7;padding-bottom:4px}',
                 '#' + CARD_ID + ' .b24c-chat-me{font-weight:600;color:#0f172a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
                 '#' + CARD_ID + ' .b24c-chat-head-btns{display:flex;align-items:center;gap:4px;flex-shrink:0}',
+                '#' + CARD_ID + ' .b24c-chat-btn-read{background:#f1f5f9;border:1px solid #cbd5e1;border-radius:3px;color:#334155;cursor:pointer;font-size:11px;padding:1px 6px;line-height:16px;white-space:nowrap;transition:all .15s}',
+                '#' + CARD_ID + ' .b24c-chat-btn-read:hover{background:#e2e8f0;border-color:#94a3b8;color:#0f172a}',
+                '#' + CARD_ID + ' .b24c-chat-btn-read.has-unread{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;font-weight:600}',
+                '#' + CARD_ID + ' .b24c-chat-btn-read.has-unread:hover{background:#dbeafe;border-color:#60a5fa}',
+                '#' + CARD_ID + ' .b24c-chat-btn-read.is-read{background:transparent;border-color:transparent;color:#64748b;cursor:default;text-decoration:none}',
+                '#' + CARD_ID + ' .b24c-chat-btn-read:disabled{opacity:0.65;cursor:default}',
                 '#' + CARD_ID + ' .b24c-chat-btn-link{background:none;border:none;color:#64748b;cursor:pointer;font-size:11px;padding:1px 4px;text-decoration:underline}',
                 '#' + CARD_ID + ' .b24c-chat-btn-link:hover{color:#0f172a}',
                 '#' + CARD_ID + ' .b24c-chat-msgs{display:flex;flex-direction:column;gap:4px;max-height:145px;overflow-y:auto;padding-right:2px}',
@@ -3988,6 +3997,9 @@ function createPlugin(parent) {
 
                     updateLeftbarBadge();
                     highlightUnreadDevices();
+                    if (activeChatContext && typeof activeChatContext.updateMarkReadBtnState === 'function') {
+                        activeChatContext.updateMarkReadBtnState();
+                    }
 
                     if (chatsPageState.open) {
                         if (wasAuth !== overviewState.authenticated || !document.querySelector('#' + CHATS_PAGE_ID + ' .b24c-dialog-list')) {
@@ -4059,6 +4071,12 @@ function createPlugin(parent) {
                 var btns = document.createElement('div');
                 btns.className = 'b24c-chat-head-btns';
 
+                var markReadBtn = document.createElement('button');
+                markReadBtn.type = 'button';
+                markReadBtn.className = 'b24c-chat-btn-read';
+                markReadBtn.title = 'Отметить сообщения прочитанными в Битрикс24';
+                markReadBtn.textContent = '✓ Прочитать';
+
                 var syncBtn = document.createElement('button');
                 syncBtn.type = 'button';
                 syncBtn.className = 'b24c-chat-btn-link';
@@ -4084,6 +4102,7 @@ function createPlugin(parent) {
                         .catch(function () { renderLoginView(); });
                 };
 
+                btns.appendChild(markReadBtn);
                 btns.appendChild(syncBtn);
                 btns.appendChild(logoutBtn);
                 head.appendChild(meLabel);
@@ -4120,9 +4139,95 @@ function createPlugin(parent) {
                 box.appendChild(sendForm);
                 box.appendChild(statusLine);
 
+                var lastFetchedMsgId = 0;
+                var isMarkingRead = false;
+                var wasExplicitlyRead = false;
+
+                function getDialogUnreadCount(dId) {
+                    if (!dId) return 0;
+                    var dialogs = overviewState.dialogs || [];
+                    for (var i = 0; i < dialogs.length; i++) {
+                        if (String(dialogs[i].dialogId) === String(dId)) {
+                            var c = Number(dialogs[i].counter) || 0;
+                            if (c > 0) return c;
+                            return dialogs[i].unread ? 1 : 0;
+                        }
+                    }
+                    var unreadNodes = overviewState.unreadNodeIds || {};
+                    var nKeys = Object.keys(unreadNodes);
+                    for (var k = 0; k < nKeys.length; k++) {
+                        var info = unreadNodes[nKeys[k]];
+                        if (info && String(info.dialogId) === String(dId)) {
+                            var nc = Number(info.counter) || 0;
+                            return nc > 0 ? nc : 1;
+                        }
+                    }
+                    return 0;
+                }
+
+                function updateMarkReadBtnState() {
+                    if (!markReadBtn) return;
+                    if (isMarkingRead) {
+                        markReadBtn.disabled = true;
+                        markReadBtn.className = 'b24c-chat-btn-read';
+                        markReadBtn.textContent = '✓ Отмечаем...';
+                        return;
+                    }
+                    var unread = getDialogUnreadCount(dialogId);
+                    if (unread > 0) {
+                        wasExplicitlyRead = false;
+                        markReadBtn.disabled = false;
+                        markReadBtn.className = 'b24c-chat-btn-read has-unread';
+                        markReadBtn.textContent = unread > 1 ? ('✓ Прочитать (' + unread + ')') : '✓ Прочитать';
+                        markReadBtn.title = 'Отметить сообщения прочитанными в Битрикс24 (' + unread + ' новых)';
+                    } else if (wasExplicitlyRead) {
+                        markReadBtn.disabled = true;
+                        markReadBtn.className = 'b24c-chat-btn-read is-read';
+                        markReadBtn.textContent = '✓ Прочитано';
+                        markReadBtn.title = 'Все сообщения прочитаны в Битрикс24';
+                    } else {
+                        markReadBtn.disabled = false;
+                        markReadBtn.className = 'b24c-chat-btn-read';
+                        markReadBtn.textContent = '✓ Прочитать';
+                        markReadBtn.title = 'Отметить сообщения прочитанными в Битрикс24';
+                    }
+                }
+
+                markReadBtn.onclick = function () {
+                    if (isMarkingRead) return;
+                    isMarkingRead = true;
+                    updateMarkReadBtnState();
+                    statusLine.style.display = 'none';
+
+                    sendPluginAction('markChatRead', { nodeId: node._id || '', dialogId: dialogId, lastMessageId: lastFetchedMsgId }, pendingChat)
+                        .then(function (res) {
+                            isMarkingRead = false;
+                            if (res && res.auth) currentAuth = res.auth;
+                            if (res && res.authRequired) {
+                                renderLoginView(res.error || 'Требуется повторный вход в Битрикс24');
+                                return;
+                            }
+                            if (!res || !res.ok) {
+                                updateMarkReadBtnState();
+                                statusLine.textContent = (res && res.error) || 'Не удалось отметить прочитанным';
+                                statusLine.style.display = 'block';
+                                return;
+                            }
+                            wasExplicitlyRead = true;
+                            clearDialogUnreadLocal(dialogId);
+                            updateMarkReadBtnState();
+                        })
+                        .catch(function (err) {
+                            isMarkingRead = false;
+                            updateMarkReadBtnState();
+                            statusLine.textContent = err && err.message ? err.message : 'Не удалось отметить прочитанным';
+                            statusLine.style.display = 'block';
+                        });
+                };
+
                 function loadMessages(silent) {
                     if (!silent) statusLine.style.display = 'none';
-                    sendPluginAction('getChatMessages', { nodeId: node._id || '', dialogId: dialogId, limit: 4, markRead: true }, pendingChat)
+                    sendPluginAction('getChatMessages', { nodeId: node._id || '', dialogId: dialogId, limit: 4, markRead: false }, pendingChat)
                         .then(function (res) {
                             if (!box.parentNode) return;
                             if (res && res.auth) currentAuth = res.auth;
@@ -4138,7 +4243,17 @@ function createPlugin(parent) {
                                 return;
                             }
                             statusLine.style.display = 'none';
-                            clearDialogUnreadLocal(dialogId);
+                            if (Array.isArray(res.messages) && res.messages.length) {
+                                var maxId = 0;
+                                for (var m = 0; m < res.messages.length; m++) {
+                                    var mid = Number(res.messages[m].id) || 0;
+                                    if (mid > maxId) maxId = mid;
+                                }
+                                if (maxId > lastFetchedMsgId) {
+                                    lastFetchedMsgId = maxId;
+                                }
+                            }
+                            updateMarkReadBtnState();
                             renderMessagesInto(msgsBox, res.messages, null, !silent);
                         })
                         .catch(function (err) {
@@ -4150,6 +4265,7 @@ function createPlugin(parent) {
                 }
 
                 activeChatContext.refreshFn = function () { loadMessages(true); };
+                activeChatContext.updateMarkReadBtnState = updateMarkReadBtnState;
                 syncBtn.onclick = function () { loadMessages(false); };
 
                 sendForm.onsubmit = function (e) {
@@ -4175,7 +4291,9 @@ function createPlugin(parent) {
                                 return;
                             }
                             msgInput.value = '';
+                            wasExplicitlyRead = true;
                             clearDialogUnreadLocal(dialogId);
+                            updateMarkReadBtnState();
                             renderMessagesInto(msgsBox, res.messages, null, true);
                             msgInput.focus();
                         })
@@ -4187,6 +4305,7 @@ function createPlugin(parent) {
                         });
                 };
 
+                updateMarkReadBtnState();
                 loadMessages(false);
 
                 if (chatPollTimer) clearInterval(chatPollTimer);

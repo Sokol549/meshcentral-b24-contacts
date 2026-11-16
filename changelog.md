@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.3
+- Disabled automatic read confirmation in the Device Summary card mini-chat: opening a computer's summary page or polling messages in MeshCentral no longer marks Bitrix24 messages as read, preserving unread status for operators.
+- Added a compact **«✓ Прочитать»** button in the mini-chat header (next to refresh and logout):
+  - Displays unread count indicator (`✓ Прочитать (N)`) and subtle highlight when there are unread messages.
+  - On click, explicitly marks messages as read in Bitrix24 via `im.dialog.read` and clears local unread badges in MeshCentral.
+  - Updates to `✓ Прочитано` once read.
+  - Automatically marks read and clears badges if the operator submits a reply directly from the mini-chat.
+
 ## 1.5.2
 - Fixed the Chats tab reply form overlapping/clipping under the MeshCentral bottom bar (`#footer` / lower container edge) by lowering `min-height` to `300px`, reserving bottom bar space (`-48px` / footer boundary detection), and recalculating height after layout.
 
